@@ -1,9 +1,8 @@
-"""Small helpers for waypoint navigation and target smoothing."""
+"""Helpers for waypoint navigation and setpoint smoothing."""
 
 from dataclasses import dataclass
 import math
 
-from offboard_takeoff.mission import MissionConfig
 from offboard_takeoff.mission import Waypoint
 
 
@@ -17,84 +16,85 @@ class TargetState:
     yaw: float
 
 
-def wrap_to_pi(angle: float) -> float:
+def normalize_angle(angle: float) -> float:
     """Normalize angle to the [-pi, pi] interval."""
 
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
-def distance_to_waypoint(
+def is_position_reached(
     current_x: float,
     current_y: float,
     current_z: float,
     waypoint: Waypoint,
-) -> float:
-    """Compute Euclidean distance to a waypoint."""
+    tolerance: float,
+) -> bool:
+    """Check whether current position is close enough to a waypoint."""
 
     dx = waypoint.x - current_x
     dy = waypoint.y - current_y
     dz = waypoint.z - current_z
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    return distance <= tolerance
 
 
-def yaw_error_to_waypoint(current_yaw: float, waypoint: Waypoint) -> float:
-    """Compute shortest yaw error to a waypoint heading."""
-
-    return wrap_to_pi(waypoint.yaw - current_yaw)
-
-
-def has_reached_waypoint(
-    current_x: float,
-    current_y: float,
-    current_z: float,
+def is_yaw_reached(
     current_yaw: float,
-    waypoint: Waypoint,
-    config: MissionConfig,
+    target_yaw: float,
+    tolerance: float,
 ) -> bool:
-    """Check whether current pose is close enough to the active waypoint."""
+    """Check whether current yaw is close enough to the target yaw."""
 
-    distance = distance_to_waypoint(current_x, current_y, current_z, waypoint)
-    yaw_error = yaw_error_to_waypoint(current_yaw, waypoint)
-    return (
-        distance <= config.position_tolerance
-        and abs(yaw_error) <= config.yaw_tolerance
-    )
+    return abs(normalize_angle(target_yaw - current_yaw)) <= tolerance
 
 
-def step_towards(current: float, goal: float, max_delta: float) -> float:
-    """Move one scalar value toward its goal with limited step size."""
+def limit_vector_step(
+    dx: float,
+    dy: float,
+    dz: float,
+    max_step: float,
+) -> tuple[float, float, float]:
+    """Limit a 3D step without changing its direction."""
 
-    delta = goal - current
-    if abs(delta) <= max_delta:
-        return goal
-    return current + math.copysign(max_delta, delta)
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if distance == 0.0 or distance <= max_step:
+        return dx, dy, dz
+
+    scale = max_step / distance
+    return dx * scale, dy * scale, dz * scale
+
+
+def limit_yaw_rate(yaw_error: float, max_step: float) -> float:
+    """Limit yaw change per control step."""
+
+    if abs(yaw_error) <= max_step:
+        return yaw_error
+    return math.copysign(max_step, yaw_error)
 
 
 def smooth_target_towards_waypoint(
     target: TargetState,
     waypoint: Waypoint,
-    config: MissionConfig,
+    control_period: float,
+    max_speed: float,
+    max_yaw_rate: float,
 ) -> TargetState:
     """Advance the commanded target toward the waypoint with limited speed."""
 
-    max_position_step = config.max_speed * config.control_period
-
-    dx = waypoint.x - target.x
-    dy = waypoint.y - target.y
-    dz = waypoint.z - target.z
-    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-    if distance > 0.0:
-        position_step = min(distance, max_position_step)
-        scale = position_step / distance
-        target.x += dx * scale
-        target.y += dy * scale
-        target.z += dz * scale
-
-    max_yaw_step = config.max_yaw_rate * config.control_period
-    yaw_error = wrap_to_pi(waypoint.yaw - target.yaw)
-    target.yaw = wrap_to_pi(
-        step_towards(target.yaw, target.yaw + yaw_error, max_yaw_step)
+    max_position_step = max_speed * control_period
+    step_x, step_y, step_z = limit_vector_step(
+        waypoint.x - target.x,
+        waypoint.y - target.y,
+        waypoint.z - target.z,
+        max_position_step,
     )
 
-    return target
+    yaw_error = normalize_angle(waypoint.yaw - target.yaw)
+    yaw_step = limit_yaw_rate(yaw_error, max_yaw_rate * control_period)
+
+    return TargetState(
+        x=target.x + step_x,
+        y=target.y + step_y,
+        z=target.z + step_z,
+        yaw=normalize_angle(target.yaw + yaw_step),
+    )
