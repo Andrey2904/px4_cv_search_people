@@ -126,6 +126,7 @@ class OffboardTakeoff(Node):
         self.declare_parameter('yaw_tolerance', 0.3)
         self.declare_parameter('px4_data_timeout_sec', 1.0)
         self.declare_parameter('waypoint_timeout_sec', 45.0)
+        self.declare_parameter('arming_timeout_sec', 5.0)
         self.declare_parameter('hold_timeout_margin_sec', 1.0)
         self.declare_parameter('return_home_on_failure', True)
         self.declare_parameter('auto_land_on_finish', True)
@@ -151,6 +152,9 @@ class OffboardTakeoff(Node):
         )
         self.waypoint_timeout_sec = float(
             self.get_parameter('waypoint_timeout_sec').value
+        )
+        self.arming_timeout_sec = float(
+            self.get_parameter('arming_timeout_sec').value
         )
         self.hold_timeout_margin_sec = float(
             self.get_parameter('hold_timeout_margin_sec').value
@@ -278,10 +282,7 @@ class OffboardTakeoff(Node):
         ):
             return self.handle_failure('Local position data timeout')
 
-        if self.last_vehicle_status_received_at is None:
-            if node_age_sec > self.px4_data_timeout_sec:
-                return self.handle_failure('PX4 status data was not received')
-        elif (
+        if self.last_vehicle_status_received_at is not None and (
             self.age_sec(self.last_vehicle_status_received_at)
             > self.px4_data_timeout_sec
         ):
@@ -508,6 +509,19 @@ class OffboardTakeoff(Node):
             self.set_state(
                 MissionState.TAKEOFF,
                 'Vehicle armed and offboard active',
+            )
+            return
+
+        if self.last_vehicle_status_received_at is None and (
+            self.time_in_state() >= self.arming_timeout_sec
+        ):
+            self.get_logger().warning(
+                'PX4 status not available, continuing with legacy arm fallback'
+            )
+            self.active_waypoint_started_at = self.get_clock().now()
+            self.set_state(
+                MissionState.TAKEOFF,
+                'Arming fallback without PX4 status confirmation',
             )
             return
 
