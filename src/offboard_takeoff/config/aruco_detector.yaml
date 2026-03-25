@@ -1,0 +1,23 @@
+aruco_detector:
+  ros__parameters:
+    use_sim_time: true
+    marker_size_m: 0.2
+    aruco_dictionary: DICT_4X4_50
+    discovery_topic_regex: '(x500_mono_cam|mono_cam|camera)'
+    topic_discovery_period_sec: 1.0
+    frame_discovery_period_sec: 2.0
+    processing_max_rate_hz: 8.0
+    detection_hold_sec: 1.0
+    publish_debug_image: false
+    debug_image_max_rate_hz: 2.0
+    debug_image_scale: 0.35
+    log_detection_events: true
+    draw_rejected_candidates: false
+    corner_subpix_refinement: true
+    tf_lookup_timeout_sec: 0.05
+    base_frame_hints:
+      - base_link
+    world_frame_hints:
+      - world
+      - map
+      - odom
