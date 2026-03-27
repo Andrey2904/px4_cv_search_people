@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+models/.venv/
+models/*.onnx
+models/*.pt
