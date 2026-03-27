@@ -1,0 +1,17 @@
+yolo_detector:
+  ros__parameters:
+    use_sim_time: true
+    image_topic: /camera/image_raw
+    model_path: ''
+    target_labels:
+      - person
+    input_width: 640
+    input_height: 640
+    confidence_threshold: 0.35
+    score_threshold: 0.25
+    nms_threshold: 0.45
+    processing_max_rate_hz: 5.0
+    publish_debug_image: true
+    debug_image_max_rate_hz: 2.0
+    detection_hold_sec: 0.75
+    swap_rb: true

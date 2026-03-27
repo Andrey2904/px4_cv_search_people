@@ -143,6 +143,9 @@ def _launch_setup(context, *args, **kwargs):
     start_viewer = _as_bool(
         LaunchConfiguration('start_viewer').perform(context)
     )
+    start_yolo = _as_bool(
+        LaunchConfiguration('start_yolo').perform(context)
+    )
     show_viewer_window = _as_bool(
         LaunchConfiguration('show_viewer_window').perform(context)
     )
@@ -171,11 +174,48 @@ def _launch_setup(context, *args, **kwargs):
     relay_camera_info_topic = LaunchConfiguration(
         'relay_camera_info_topic'
     ).perform(context)
+    yolo_model_path = LaunchConfiguration('yolo_model_path').perform(context)
+    yolo_inference_backend = LaunchConfiguration(
+        'yolo_inference_backend'
+    ).perform(context)
+    yolo_prefer_gpu = _as_bool(
+        LaunchConfiguration('yolo_prefer_gpu').perform(context)
+    )
+    yolo_input_width = int(
+        LaunchConfiguration('yolo_input_width').perform(context)
+    )
+    yolo_input_height = int(
+        LaunchConfiguration('yolo_input_height').perform(context)
+    )
+    yolo_confidence_threshold = float(
+        LaunchConfiguration('yolo_confidence_threshold').perform(context)
+    )
+    yolo_score_threshold = float(
+        LaunchConfiguration('yolo_score_threshold').perform(context)
+    )
+    yolo_nms_threshold = float(
+        LaunchConfiguration('yolo_nms_threshold').perform(context)
+    )
+    yolo_processing_max_rate_hz = float(
+        LaunchConfiguration('yolo_processing_max_rate_hz').perform(context)
+    )
+    yolo_diagnostic_log_period_sec = float(
+        LaunchConfiguration('yolo_diagnostic_log_period_sec').perform(context)
+    )
+    yolo_show_debug_window = _as_bool(
+        LaunchConfiguration('yolo_show_debug_window').perform(context)
+    )
+    yolo_debug_view_scale = float(
+        LaunchConfiguration('yolo_debug_view_scale').perform(context)
+    )
+    yolo_show_fps_overlay = _as_bool(
+        LaunchConfiguration('yolo_show_fps_overlay').perform(context)
+    )
 
     actions = []
     selection = None
 
-    if enable_bridge or start_viewer:
+    if enable_bridge or start_viewer or start_yolo:
         if manual_image_topic and manual_camera_info_topic:
             selection = {
                 'image_topic': manual_image_topic,
@@ -265,6 +305,44 @@ def _launch_setup(context, *args, **kwargs):
             )
         )
 
+    if start_yolo:
+        actions.append(
+            Node(
+                package='offboard_takeoff',
+                executable='yolo_detector',
+                name='yolo_detector',
+                output='screen',
+                parameters=[
+                    {
+                        'image_topic': selection['image_topic'],
+                        'model_path': yolo_model_path,
+                        'inference_backend': yolo_inference_backend,
+                        'prefer_gpu': yolo_prefer_gpu,
+                        'target_labels': ['person'],
+                        'input_width': yolo_input_width,
+                        'input_height': yolo_input_height,
+                        'confidence_threshold': yolo_confidence_threshold,
+                        'score_threshold': yolo_score_threshold,
+                        'nms_threshold': yolo_nms_threshold,
+                        'processing_max_rate_hz': yolo_processing_max_rate_hz,
+                        'diagnostic_log_period_sec': (
+                            yolo_diagnostic_log_period_sec
+                        ),
+                        'show_debug_window': yolo_show_debug_window,
+                        'debug_view_scale': yolo_debug_view_scale,
+                        'show_fps_overlay': yolo_show_fps_overlay,
+                        'use_sim_time': use_sim_time,
+                    }
+                ],
+            )
+        )
+    else:
+        actions.append(
+            LogInfo(
+                msg='start_yolo:=false, yolo_detector will not be started.'
+            )
+        )
+
     return actions
 
 
@@ -288,8 +366,13 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 'show_viewer_window',
-                default_value='true',
+                default_value='false',
                 description='Show the image in an OpenCV window.',
+            ),
+            DeclareLaunchArgument(
+                'start_yolo',
+                default_value='false',
+                description='Start the YOLO object detector node.',
             ),
             DeclareLaunchArgument(
                 'log_camera_info',
@@ -298,7 +381,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 'enable_aruco_overlay',
-                default_value='true',
+                default_value='false',
                 description='Draw simple ArUco detections in the viewer window.',
             ),
             DeclareLaunchArgument(
@@ -359,6 +442,71 @@ def generate_launch_description() -> LaunchDescription:
                 'relay_camera_info_topic',
                 default_value='/camera/camera_info',
                 description='Stable ROS 2 CameraInfo topic published by the viewer relay.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_model_path',
+                default_value='',
+                description='Path to a YOLO ONNX model file.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_inference_backend',
+                default_value='auto',
+                description='YOLO backend: auto, onnxruntime, or opencv.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_prefer_gpu',
+                default_value='true',
+                description='Prefer CUDAExecutionProvider when available.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_input_width',
+                default_value='640',
+                description='YOLO model input width.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_input_height',
+                default_value='640',
+                description='YOLO model input height.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_confidence_threshold',
+                default_value='0.35',
+                description='Minimum confidence for YOLO detections.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_score_threshold',
+                default_value='0.25',
+                description='Minimum raw class score for YOLO detections.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_nms_threshold',
+                default_value='0.45',
+                description='NMS threshold for YOLO detections.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_processing_max_rate_hz',
+                default_value='2.0',
+                description='Maximum YOLO inference rate.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_diagnostic_log_period_sec',
+                default_value='0.0',
+                description='How often to print raw YOLO class candidates. Set 0 to disable.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_show_debug_window',
+                default_value='true',
+                description='Show a YOLO debug window with colored bounding boxes.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_debug_view_scale',
+                default_value='0.75',
+                description='Display scale for the YOLO debug window and debug image.',
+            ),
+            DeclareLaunchArgument(
+                'yolo_show_fps_overlay',
+                default_value='true',
+                description='Draw YOLO FPS on the debug view.',
             ),
             OpaqueFunction(function=_launch_setup),
         ]
