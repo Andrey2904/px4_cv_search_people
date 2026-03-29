@@ -188,6 +188,11 @@ class YoloDetector(Node):
             'yolo/bounding_boxes',
             10,
         )
+        self.target_bbox_pub = self.create_publisher(
+            Int32MultiArray,
+            'yolo/target_bbox',
+            10,
+        )
         self.class_labels_pub = self.create_publisher(
             String,
             'yolo/class_labels',
@@ -246,7 +251,10 @@ class YoloDetector(Node):
         ).strip().lower()
         self.prefer_gpu = bool(self.get_parameter('prefer_gpu').value)
         self.target_labels = list(self.get_parameter('target_labels').value)
-        self.input_width = max(int(self.get_parameter('input_width').value), 32)
+        self.input_width = max(
+            int(self.get_parameter('input_width').value),
+            32,
+        )
         self.input_height = max(
             int(self.get_parameter('input_height').value),
             32,
@@ -410,7 +418,11 @@ class YoloDetector(Node):
             return
 
         detections = self._run_inference(frame)
-        self._publish_detection_status(detections)
+        self._publish_detection_status(
+            detections=detections,
+            frame_width=frame.shape[1],
+            frame_height=frame.shape[0],
+        )
         self._update_fps()
 
         if not self._should_publish_debug_image():
@@ -423,7 +435,10 @@ class YoloDetector(Node):
 
         debug_frame = self._draw_detections(frame.copy(), detections)
         if self.show_debug_window:
-            cv2.imshow('YOLO Debug View', self._prepare_debug_frame(debug_frame))
+            cv2.imshow(
+                'YOLO Debug View',
+                self._prepare_debug_frame(debug_frame),
+            )
             cv2.waitKey(1)
         debug_msg = self._bgr_to_image_message(
             frame=self._prepare_debug_frame(debug_frame),
@@ -486,7 +501,11 @@ class YoloDetector(Node):
 
         detections: list[Detection] = []
         for raw_index in kept_indices:
-            index = int(raw_index[0] if isinstance(raw_index, (list, tuple, np.ndarray)) else raw_index)
+            index = int(
+                raw_index[0]
+                if isinstance(raw_index, (list, tuple, np.ndarray))
+                else raw_index
+            )
             x, y, width, height = boxes[index]
             class_id = class_ids[index]
             detections.append(
@@ -607,7 +626,10 @@ class YoloDetector(Node):
             return output.reshape(output.shape[-2], output.shape[-1])
 
         expected_features = len(self.class_names) + 4
-        if output.shape[0] == expected_features or output.shape[0] == expected_features + 1:
+        if (
+            output.shape[0] == expected_features
+            or output.shape[0] == expected_features + 1
+        ):
             output = output.transpose()
 
         return output
@@ -640,7 +662,9 @@ class YoloDetector(Node):
                 if self.smoothed_fps <= 0.0:
                     self.smoothed_fps = instant_fps
                 else:
-                    self.smoothed_fps = 0.85 * self.smoothed_fps + 0.15 * instant_fps
+                    self.smoothed_fps = (
+                        0.85 * self.smoothed_fps + 0.15 * instant_fps
+                    )
         self.last_fps_timestamp_ns = now_ns
 
     def _draw_fps_overlay(self, frame: np.ndarray):
@@ -742,7 +766,10 @@ class YoloDetector(Node):
         class_score = float(class_scores[class_id])
         confidence = objectness * class_score
 
-        if confidence < self.confidence_threshold or class_score < self.score_threshold:
+        if (
+            confidence < self.confidence_threshold
+            or class_score < self.score_threshold
+        ):
             return None, confidence, None
 
         x1 = (cx - width / 2.0 - letterbox.pad_x) / letterbox.scale
@@ -763,7 +790,12 @@ class YoloDetector(Node):
 
         return class_id, confidence, [x1, y1, width_px, height_px]
 
-    def _publish_detection_status(self, detections: list[Detection]):
+    def _publish_detection_status(
+        self,
+        detections: list[Detection],
+        frame_width: int,
+        frame_height: int,
+    ):
         """Publish summary topics for downstream logic."""
 
         labels = [detection.label for detection in detections]
@@ -782,6 +814,18 @@ class YoloDetector(Node):
             )
 
         has_target = self._has_target_detection(detections)
+        target = self._best_target_detection(detections)
+        target_bbox: list[int] = []
+        if target is not None:
+            target_bbox = [
+                int(round(target.confidence * 1000.0)),
+                int(round((target.x1 + target.x2) / 2.0)),
+                int(round((target.y1 + target.y2) / 2.0)),
+                int(target.x2 - target.x1),
+                int(target.y2 - target.y1),
+                int(frame_width),
+                int(frame_height),
+            ]
         now_ns = self.get_clock().now().nanoseconds
         if has_target:
             self.last_seen_target_ns = now_ns
@@ -802,23 +846,25 @@ class YoloDetector(Node):
         self.bounding_boxes_pub.publish(
             Int32MultiArray(data=bounding_boxes)
         )
+        self.target_bbox_pub.publish(Int32MultiArray(data=target_bbox))
         self.class_labels_pub.publish(String(data=','.join(labels)))
 
         self._log_target_summary(detections)
 
         if effective_has_target != self.last_detection_state:
             if effective_has_target:
-                target = self._best_target_detection(detections)
                 if target is not None:
                     self.get_logger().info(
                         'Person detected: '
                         f'confidence={target.confidence:.2f}, '
-                        f'bbox=({target.x1}, {target.y1})-({target.x2}, {target.y2}), '
+                        f'bbox=({target.x1}, {target.y1})-'
+                        f'({target.x2}, {target.y2}), '
                         f'classes_in_frame={labels or ["<none>"]}'
                     )
                 else:
                     self.get_logger().info(
-                        f'Target detected. Classes in frame: {labels or ["<none>"]}'
+                        'Target detected. Classes in frame: '
+                        f'{labels or ["<none>"]}'
                     )
             else:
                 self.get_logger().info('Person lost')
@@ -851,10 +897,13 @@ class YoloDetector(Node):
         ]
         if not target_detections:
             return None
-        return max(target_detections, key=lambda detection: detection.confidence)
+        return max(
+            target_detections,
+            key=lambda detection: detection.confidence,
+        )
 
     def _log_target_summary(self, detections: list[Detection]):
-        """Periodically log the strongest target detection in a readable form."""
+        """Periodically log the strongest target detection clearly."""
 
         target = self._best_target_detection(detections)
         if target is None:
@@ -1075,7 +1124,8 @@ class YoloDetector(Node):
         channels = channel_map.get(msg.encoding)
         if channels is None:
             self.get_logger().error(
-                f'Unsupported image encoding for YOLO detection: {msg.encoding}'
+                'Unsupported image encoding for YOLO detection: '
+                f'{msg.encoding}'
             )
             return None
 
@@ -1096,7 +1146,9 @@ class YoloDetector(Node):
             )
             return None
 
-        frame = frame_buffer[:expected_size].reshape((int(msg.height), row_stride))
+        frame = frame_buffer[:expected_size].reshape(
+            (int(msg.height), row_stride)
+        )
         frame = frame[:, :min_row_stride].reshape(
             int(msg.height),
             int(msg.width),

@@ -1,5 +1,6 @@
 """ROS2 node for the PX4 offboard waypoint mission."""
 
+from dataclasses import dataclass
 from enum import Enum
 import math
 
@@ -13,6 +14,7 @@ from rclpy.qos import DurabilityPolicy
 from rclpy.qos import HistoryPolicy
 from rclpy.qos import QoSProfile
 from rclpy.qos import ReliabilityPolicy
+from std_msgs.msg import Int32MultiArray
 
 from offboard_takeoff.mission import MissionPlan
 from offboard_takeoff.mission import Waypoint
@@ -32,10 +34,70 @@ class MissionState(Enum):
     TAKEOFF = 'TAKEOFF'
     SEARCH = 'SEARCH'
     HOLD = 'HOLD'
+    FOLLOW_PERSON = 'FOLLOW_PERSON'
     RETURN_HOME = 'RETURN_HOME'
     LAND = 'LAND'
     FAILSAFE = 'FAILSAFE'
     FINISHED = 'FINISHED'
+
+
+@dataclass(frozen=True)
+class PersonTarget:
+    """Best detected person bounding box and image metadata."""
+
+    confidence: float
+    center_x: int
+    center_y: int
+    width: int
+    height: int
+    image_width: int
+    image_height: int
+
+    @property
+    def center_x_error(self) -> float:
+        """Normalized horizontal error relative to the image center."""
+
+        if self.image_width <= 0:
+            return 0.0
+        return (
+            float(self.center_x) - float(self.image_width) / 2.0
+        ) / max(float(self.image_width) / 2.0, 1.0)
+
+    @property
+    def height_ratio(self) -> float:
+        """Bounding box height normalized by image height."""
+
+        if self.image_height <= 0:
+            return 0.0
+        return float(self.height) / float(self.image_height)
+
+    @property
+    def width_ratio(self) -> float:
+        """Bounding box width normalized by image width."""
+
+        if self.image_width <= 0:
+            return 0.0
+        return float(self.width) / float(self.image_width)
+
+    @property
+    def left_ratio(self) -> float:
+        """Left bbox edge normalized by image width."""
+
+        if self.image_width <= 0:
+            return 0.0
+        return (
+            float(self.center_x) - float(self.width) / 2.0
+        ) / float(self.image_width)
+
+    @property
+    def right_ratio(self) -> float:
+        """Right bbox edge normalized by image width."""
+
+        if self.image_width <= 0:
+            return 1.0
+        return (
+            float(self.center_x) + float(self.width) / 2.0
+        ) / float(self.image_width)
 
 
 class OffboardTakeoff(Node):
@@ -56,6 +118,7 @@ class OffboardTakeoff(Node):
         self.vehicle_status: VehicleStatus | None = None
         self.home_position: Waypoint | None = None
         self.return_home_waypoint: Waypoint | None = None
+        self.person_target: PersonTarget | None = None
 
         self.node_started_at = self.get_clock().now()
         self.state_entered_at = self.node_started_at
@@ -64,6 +127,15 @@ class OffboardTakeoff(Node):
         self.last_vision_received_at = None
         self.active_waypoint_started_at = None
         self.last_offboard_request_at = None
+        self.last_person_follow_log_at = self.node_started_at
+        self.person_follow_started_at = None
+        self.person_centered_since = None
+        self.person_yaw_locked = False
+        self.person_hold_yaw = None
+        self.filtered_person_center_x_error = 0.0
+        self.filtered_follow_yaw_rate = 0.0
+        self.previous_person_center_x_error = 0.0
+        self.previous_yaw_error_sample_at = None
 
         self.state = MissionState.INIT
         self.failure_reason = ''
@@ -110,6 +182,12 @@ class OffboardTakeoff(Node):
             self.vehicle_status_callback,
             px4_qos,
         )
+        self.create_subscription(
+            Int32MultiArray,
+            'yolo/target_bbox',
+            self.person_target_callback,
+            10,
+        )
 
         self.timer = self.create_timer(self.control_period, self.control_loop)
         self.get_logger().info('OffboardTakeoff node started')
@@ -132,6 +210,25 @@ class OffboardTakeoff(Node):
         self.declare_parameter('auto_land_on_finish', True)
         self.declare_parameter('enable_vision', False)
         self.declare_parameter('vision_timeout_sec', 1.0)
+        self.declare_parameter('enable_person_follow', True)
+        self.declare_parameter('follow_person_timeout_sec', 1.0)
+        self.declare_parameter('follow_forward_speed', 0.35)
+        self.declare_parameter('follow_slow_forward_speed', 0.15)
+        self.declare_parameter('follow_stop_bbox_height_ratio', 0.33)
+        self.declare_parameter('follow_slow_bbox_height_ratio', 0.22)
+        self.declare_parameter('follow_frame_edge_margin_ratio', 0.08)
+        self.declare_parameter('follow_yaw_kp', 0.9)
+        self.declare_parameter('follow_yaw_kd', 0.0)
+        self.declare_parameter('follow_yaw_deadband', 0.05)
+        self.declare_parameter('follow_yaw_unlock_deadband', 0.12)
+        self.declare_parameter('follow_yaw_rate_filter_alpha', 0.35)
+        self.declare_parameter('follow_lateral_gain', 0.35)
+        self.declare_parameter('follow_lateral_deadband', 0.20)
+        self.declare_parameter('follow_log_period_sec', 1.0)
+        self.declare_parameter('follow_target_lead_limit', 1.5)
+        self.declare_parameter('follow_alignment_hold_sec', 1.0)
+        self.declare_parameter('follow_centered_hold_sec', 0.35)
+        self.declare_parameter('follow_error_filter_alpha', 0.25)
 
     def _load_parameters(self):
         """Load ROS2 parameters into node fields."""
@@ -168,6 +265,63 @@ class OffboardTakeoff(Node):
         self.enable_vision = bool(self.get_parameter('enable_vision').value)
         self.vision_timeout_sec = float(
             self.get_parameter('vision_timeout_sec').value
+        )
+        self.enable_person_follow = bool(
+            self.get_parameter('enable_person_follow').value
+        )
+        self.follow_person_timeout_sec = float(
+            self.get_parameter('follow_person_timeout_sec').value
+        )
+        self.follow_forward_speed = float(
+            self.get_parameter('follow_forward_speed').value
+        )
+        self.follow_slow_forward_speed = float(
+            self.get_parameter('follow_slow_forward_speed').value
+        )
+        self.follow_stop_bbox_height_ratio = float(
+            self.get_parameter('follow_stop_bbox_height_ratio').value
+        )
+        self.follow_slow_bbox_height_ratio = float(
+            self.get_parameter('follow_slow_bbox_height_ratio').value
+        )
+        self.follow_frame_edge_margin_ratio = float(
+            self.get_parameter('follow_frame_edge_margin_ratio').value
+        )
+        self.follow_yaw_kp = float(
+            self.get_parameter('follow_yaw_kp').value
+        )
+        self.follow_yaw_kd = float(
+            self.get_parameter('follow_yaw_kd').value
+        )
+        self.follow_yaw_deadband = float(
+            self.get_parameter('follow_yaw_deadband').value
+        )
+        self.follow_yaw_unlock_deadband = float(
+            self.get_parameter('follow_yaw_unlock_deadband').value
+        )
+        self.follow_yaw_rate_filter_alpha = float(
+            self.get_parameter('follow_yaw_rate_filter_alpha').value
+        )
+        self.follow_lateral_gain = float(
+            self.get_parameter('follow_lateral_gain').value
+        )
+        self.follow_lateral_deadband = float(
+            self.get_parameter('follow_lateral_deadband').value
+        )
+        self.follow_log_period_sec = float(
+            self.get_parameter('follow_log_period_sec').value
+        )
+        self.follow_target_lead_limit = float(
+            self.get_parameter('follow_target_lead_limit').value
+        )
+        self.follow_alignment_hold_sec = float(
+            self.get_parameter('follow_alignment_hold_sec').value
+        )
+        self.follow_centered_hold_sec = float(
+            self.get_parameter('follow_centered_hold_sec').value
+        )
+        self.follow_error_filter_alpha = float(
+            self.get_parameter('follow_error_filter_alpha').value
         )
 
     @property
@@ -210,6 +364,31 @@ class OffboardTakeoff(Node):
         self.vehicle_status = msg
         self.last_vehicle_status_received_at = self.get_clock().now()
 
+    def person_target_callback(self, msg: Int32MultiArray):
+        """Store the latest best-person bounding box from YOLO."""
+
+        data = list(msg.data)
+        if len(data) < 7:
+            self.person_target = None
+            return
+
+        self.person_target = PersonTarget(
+            confidence=float(data[0]) / 1000.0,
+            center_x=int(data[1]),
+            center_y=int(data[2]),
+            width=max(int(data[3]), 0),
+            height=max(int(data[4]), 0),
+            image_width=max(int(data[5]), 1),
+            image_height=max(int(data[6]), 1),
+        )
+        alpha = min(max(self.follow_error_filter_alpha, 0.0), 1.0)
+        raw_error = self.person_target.center_x_error
+        self.filtered_person_center_x_error = (
+            alpha * raw_error
+            + (1.0 - alpha) * self.filtered_person_center_x_error
+        )
+        self.mark_vision_update()
+
     def mark_vision_update(self):
         """Update the optional vision timestamp for future integrations."""
 
@@ -246,12 +425,30 @@ class OffboardTakeoff(Node):
             MissionState.TAKEOFF,
             MissionState.SEARCH,
             MissionState.HOLD,
+            MissionState.FOLLOW_PERSON,
             MissionState.RETURN_HOME,
         }:
             self.active_waypoint_started_at = None
+            self.person_follow_started_at = None
+            self.person_centered_since = None
+            self.person_yaw_locked = False
+            self.person_hold_yaw = None
+            self.filtered_follow_yaw_rate = 0.0
+            self.previous_yaw_error_sample_at = None
 
         if new_state == MissionState.LAND:
             self.landing_command_sent = False
+
+        if new_state == MissionState.FOLLOW_PERSON:
+            self.person_follow_started_at = self.get_clock().now()
+            self.person_centered_since = None
+            self.person_yaw_locked = False
+            self.person_hold_yaw = None
+            self.filtered_follow_yaw_rate = 0.0
+            self.previous_person_center_x_error = (
+                self.filtered_person_center_x_error
+            )
+            self.previous_yaw_error_sample_at = self.get_clock().now()
 
         log_message = f'State {old_state.value} -> {new_state.value}'
         if reason:
@@ -295,6 +492,7 @@ class OffboardTakeoff(Node):
             self.state in {
                 MissionState.TAKEOFF,
                 MissionState.SEARCH,
+                MissionState.FOLLOW_PERSON,
                 MissionState.RETURN_HOME,
             }
             and self.active_waypoint_started_at is not None
@@ -441,6 +639,7 @@ class OffboardTakeoff(Node):
             MissionState.TAKEOFF: self.handle_takeoff,
             MissionState.SEARCH: self.handle_search,
             MissionState.HOLD: self.handle_hold,
+            MissionState.FOLLOW_PERSON: self.handle_follow_person,
             MissionState.RETURN_HOME: self.handle_return_home,
             MissionState.LAND: self.handle_land,
             MissionState.FAILSAFE: self.handle_failsafe,
@@ -537,6 +736,7 @@ class OffboardTakeoff(Node):
         self._update_smoothed_target()
 
         if not self._has_reached_active_waypoint(check_yaw=True):
+            self._maybe_start_person_follow()
             return
 
         self.get_logger().info('Takeoff waypoint reached')
@@ -557,6 +757,9 @@ class OffboardTakeoff(Node):
         waypoint = self.current_search_waypoint
         if waypoint is None:
             self._complete_mission()
+            return
+
+        if self._maybe_start_person_follow():
             return
 
         self._update_smoothed_target()
@@ -588,10 +791,63 @@ class OffboardTakeoff(Node):
             self._complete_mission()
             return
 
+        if self._maybe_start_person_follow():
+            return
+
         self._update_smoothed_target()
 
         if self.time_in_state() >= self.current_search_waypoint.hold_time:
             self._advance_search_or_finish()
+
+    def handle_follow_person(self):
+        """Approach the detected person using conservative image cues."""
+
+        if self.vehicle_local_position is None:
+            return
+
+        person_target = self._current_person_target()
+        if person_target is None:
+            self._hold_current_position_target()
+            self.set_state(
+                MissionState.SEARCH,
+                'Person target timed out, returning to search',
+            )
+            return
+
+        if self._should_stop_near_person(person_target):
+            self._hold_person_follow_position()
+            self._log_person_follow_status(person_target, stopped=True)
+            return
+
+        if self._is_person_follow_centered():
+            self._update_person_follow_target(
+                person_target,
+                allow_forward_motion=True,
+            )
+            self._log_person_follow_status(person_target, stopped=True)
+            return
+
+        if self._is_person_follow_alignment_phase(person_target):
+            self._update_person_follow_target(
+                person_target,
+                allow_forward_motion=False,
+            )
+            self._log_person_follow_status(
+                person_target,
+                stopped=False,
+                aligning=True,
+            )
+            return
+
+        self._update_person_follow_target(
+            person_target,
+            allow_forward_motion=True,
+        )
+        self._log_person_follow_status(
+            person_target,
+            stopped=False,
+            aligning=False,
+        )
 
     def handle_return_home(self):
         """Fly back to the saved home position before landing."""
@@ -642,6 +898,7 @@ class OffboardTakeoff(Node):
             MissionState.TAKEOFF,
             MissionState.SEARCH,
             MissionState.HOLD,
+            MissionState.FOLLOW_PERSON,
             MissionState.RETURN_HOME,
             MissionState.FAILSAFE,
         }
@@ -695,6 +952,314 @@ class OffboardTakeoff(Node):
             max_speed=self.max_speed,
             max_yaw_rate=self.max_yaw_rate,
         )
+
+    def _maybe_start_person_follow(self) -> bool:
+        """Switch from search logic into person follow when vision is ready."""
+
+        if self.state not in {MissionState.SEARCH, MissionState.HOLD}:
+            return False
+        if not self.enable_person_follow:
+            return False
+
+        person_target = self._current_person_target()
+        if person_target is None:
+            return False
+
+        self.active_waypoint_started_at = self.get_clock().now()
+        self.set_state(
+            MissionState.FOLLOW_PERSON,
+            'Person detected, starting visual approach',
+        )
+        self._hold_current_position_target()
+        return True
+
+    def _current_person_target(self) -> PersonTarget | None:
+        """Return a fresh person target or None when it is stale."""
+
+        if self.person_target is None:
+            return None
+        if (
+            self.last_vision_received_at is None
+            or self.age_sec(self.last_vision_received_at)
+            > self.follow_person_timeout_sec
+        ):
+            return None
+        return self.person_target
+
+    def _should_stop_near_person(self, person_target: PersonTarget) -> bool:
+        """Stop advancing when the target appears too close or unstable."""
+
+        return bool(
+            person_target.height_ratio >= self.follow_stop_bbox_height_ratio
+            or person_target.left_ratio <= self.follow_frame_edge_margin_ratio
+            or person_target.right_ratio
+            >= 1.0 - self.follow_frame_edge_margin_ratio
+        )
+
+    def _is_person_follow_centered(self) -> bool:
+        """Return whether yaw should stay locked on the current centered target."""
+
+        error = abs(self.filtered_person_center_x_error)
+        now = self.get_clock().now()
+
+        if self.person_yaw_locked:
+            if error > self.follow_yaw_unlock_deadband:
+                self.person_yaw_locked = False
+                self.person_hold_yaw = None
+                self.person_centered_since = None
+                return False
+            return True
+
+        if error > self.follow_yaw_deadband:
+            self.person_centered_since = None
+            return False
+
+        if self.person_centered_since is None:
+            self.person_centered_since = now
+            return False
+
+        if self.age_sec(self.person_centered_since) < self.follow_centered_hold_sec:
+            return False
+
+        if self.target is not None and math.isfinite(self.target.yaw):
+            self.person_hold_yaw = self.target.yaw
+        else:
+            self.person_hold_yaw = self.vehicle_local_position.heading
+        self.person_yaw_locked = True
+        self.filtered_follow_yaw_rate = 0.0
+        return True
+
+    def _hold_person_follow_position(self):
+        """Freeze position and reset yaw-follow state while the target stays centered."""
+
+        if self.vehicle_local_position is None:
+            return
+
+        hold_yaw = self.person_hold_yaw
+        if hold_yaw is None or not math.isfinite(hold_yaw):
+            hold_yaw = self.vehicle_local_position.heading
+        if not math.isfinite(hold_yaw):
+            hold_yaw = self.target.yaw
+
+        self.target = TargetState(
+            x=self.vehicle_local_position.x,
+            y=self.vehicle_local_position.y,
+            z=self.vehicle_local_position.z,
+            yaw=hold_yaw,
+        )
+        self.previous_person_center_x_error = (
+            self.filtered_person_center_x_error
+        )
+        self.filtered_follow_yaw_rate = 0.0
+        self.previous_yaw_error_sample_at = self.get_clock().now()
+
+    def _is_person_follow_alignment_phase(
+        self,
+        person_target: PersonTarget,
+    ) -> bool:
+        """Return whether follow mode should still spend time aligning."""
+
+        if self.person_follow_started_at is None:
+            return False
+        if self.follow_alignment_hold_sec <= 0.0:
+            return False
+
+        if self.person_yaw_locked:
+            return False
+
+        alignment_error = abs(self.filtered_person_center_x_error)
+        if alignment_error > self.follow_yaw_unlock_deadband:
+            self.person_centered_since = None
+            return True
+
+        if self.person_centered_since is None:
+            self.person_centered_since = self.get_clock().now()
+
+        return (
+            self.age_sec(self.person_follow_started_at)
+            < self.follow_alignment_hold_sec
+            or self.age_sec(self.person_centered_since)
+            < self.follow_centered_hold_sec
+        )
+
+    def _update_person_follow_target(
+        self,
+        person_target: PersonTarget,
+        allow_forward_motion: bool,
+    ):
+        """Shift the position target toward the detected person."""
+
+        heading = self.vehicle_local_position.heading
+        if not math.isfinite(heading):
+            heading = self.target.yaw
+
+        if self.person_yaw_locked:
+            self._update_locked_person_follow_target(
+                person_target,
+                allow_forward_motion=allow_forward_motion,
+            )
+            return
+
+        lead_dx = self.target.x - self.vehicle_local_position.x
+        lead_dy = self.target.y - self.vehicle_local_position.y
+        lead_distance = math.hypot(lead_dx, lead_dy)
+        if lead_distance > self.follow_target_lead_limit:
+            base_x = self.vehicle_local_position.x
+            base_y = self.vehicle_local_position.y
+            base_yaw = heading
+        else:
+            base_x = self.target.x
+            base_y = self.target.y
+            if math.isfinite(self.target.yaw):
+                base_yaw = self.target.yaw
+            else:
+                base_yaw = heading
+
+        horizontal_error = self.filtered_person_center_x_error
+        yaw_rate_cmd = 0.0
+        if abs(horizontal_error) > self.follow_yaw_deadband:
+            now = self.get_clock().now()
+            derivative = 0.0
+            if self.previous_yaw_error_sample_at is not None:
+                dt = self.age_sec(self.previous_yaw_error_sample_at)
+                if dt > 1e-3:
+                    derivative = (
+                        horizontal_error - self.previous_person_center_x_error
+                    ) / dt
+            yaw_rate_cmd = (
+                self.follow_yaw_kp * horizontal_error
+                + self.follow_yaw_kd * derivative
+            )
+            self.previous_person_center_x_error = horizontal_error
+            self.previous_yaw_error_sample_at = now
+        else:
+            self.previous_person_center_x_error = horizontal_error
+            self.previous_yaw_error_sample_at = self.get_clock().now()
+
+        yaw_rate_cmd = max(
+            min(yaw_rate_cmd, self.max_yaw_rate),
+            -self.max_yaw_rate,
+        )
+        yaw_rate_alpha = min(
+            max(self.follow_yaw_rate_filter_alpha, 0.0),
+            1.0,
+        )
+        self.filtered_follow_yaw_rate = (
+            yaw_rate_alpha * yaw_rate_cmd
+            + (1.0 - yaw_rate_alpha) * self.filtered_follow_yaw_rate
+        )
+        next_yaw = self._normalize_angle(
+            base_yaw + self.filtered_follow_yaw_rate * self.control_period
+        )
+
+        forward_step = 0.0
+        if allow_forward_motion:
+            forward_speed = self.follow_forward_speed
+            if (
+                person_target.height_ratio
+                >= self.follow_slow_bbox_height_ratio
+            ):
+                forward_speed = min(
+                    forward_speed,
+                    self.follow_slow_forward_speed,
+                )
+            forward_step = max(forward_speed, 0.0) * self.control_period
+
+        lateral_step = 0.0
+        if (
+            allow_forward_motion
+            and abs(horizontal_error) > self.follow_lateral_deadband
+        ):
+            lateral_step = (
+                -horizontal_error
+                * self.follow_lateral_gain
+                * self.control_period
+            )
+
+        self.target = TargetState(
+            x=base_x
+            + math.cos(next_yaw) * forward_step
+            - math.sin(next_yaw) * lateral_step,
+            y=base_y
+            + math.sin(next_yaw) * forward_step
+            + math.cos(next_yaw) * lateral_step,
+            z=self.mission_plan.takeoff_waypoint.z,
+            yaw=next_yaw,
+        )
+
+    def _update_locked_person_follow_target(
+        self,
+        person_target: PersonTarget,
+        allow_forward_motion: bool,
+    ):
+        """Advance straight ahead while keeping the previously locked yaw."""
+
+        if self.vehicle_local_position is None:
+            return
+
+        locked_yaw = self.person_hold_yaw
+        if locked_yaw is None or not math.isfinite(locked_yaw):
+            locked_yaw = self.target.yaw
+        if not math.isfinite(locked_yaw):
+            locked_yaw = self.vehicle_local_position.heading
+
+        base_x = self.vehicle_local_position.x
+        base_y = self.vehicle_local_position.y
+
+        forward_step = 0.0
+        if allow_forward_motion:
+            forward_speed = self.follow_forward_speed
+            if (
+                person_target.height_ratio
+                >= self.follow_slow_bbox_height_ratio
+            ):
+                forward_speed = min(
+                    forward_speed,
+                    self.follow_slow_forward_speed,
+                )
+            forward_step = max(forward_speed, 0.0) * self.control_period
+
+        self.target = TargetState(
+            x=base_x + math.cos(locked_yaw) * forward_step,
+            y=base_y + math.sin(locked_yaw) * forward_step,
+            z=self.mission_plan.takeoff_waypoint.z,
+            yaw=locked_yaw,
+        )
+
+    def _log_person_follow_status(
+        self,
+        person_target: PersonTarget,
+        stopped: bool,
+        aligning: bool = False,
+    ):
+        """Throttle follow logs so approach behavior is easy to inspect."""
+
+        if self.follow_log_period_sec <= 0.0:
+            return
+        if (
+            self.age_sec(self.last_person_follow_log_at)
+            < self.follow_log_period_sec
+        ):
+            return
+
+        if stopped:
+            action = 'holding near person'
+        elif aligning:
+            action = 'aligning before approach'
+        else:
+            action = 'approaching person'
+        self.get_logger().info(
+            f'{action}: '
+            f'confidence={person_target.confidence:.2f}, '
+            f'height_ratio={person_target.height_ratio:.2f}, '
+            f'center_x_error={self.filtered_person_center_x_error:.2f}'
+        )
+        self.last_person_follow_log_at = self.get_clock().now()
+
+    def _normalize_angle(self, angle: float) -> float:
+        """Normalize angle to the [-pi, pi] interval."""
+
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     def _has_reached_active_waypoint(self, check_yaw: bool) -> bool:
         """Check whether the vehicle has reached the active waypoint."""
