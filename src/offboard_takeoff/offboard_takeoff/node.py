@@ -119,6 +119,7 @@ class OffboardTakeoff(Node):
         self.home_position: Waypoint | None = None
         self.return_home_waypoint: Waypoint | None = None
         self.person_target: PersonTarget | None = None
+        self.last_stable_person_target: PersonTarget | None = None
 
         self.node_started_at = self.get_clock().now()
         self.state_entered_at = self.node_started_at
@@ -128,10 +129,21 @@ class OffboardTakeoff(Node):
         self.active_waypoint_started_at = None
         self.last_offboard_request_at = None
         self.last_person_follow_log_at = self.node_started_at
+        self.last_person_detection_log_at = None
         self.person_follow_started_at = None
+        self.person_action_phase = ''
+        self.person_action_phase_started_at = None
+        self.person_reference_bbox_height = 0.0
+        self.person_detection_started_at = None
+        self.person_detection_lost_at = None
+        self.person_align_loss_started_at = None
+        self.person_follow_confirmation_logged = False
+        self.person_visible_since = None
+        self.last_stable_person_target_at = None
         self.person_centered_since = None
         self.person_yaw_locked = False
         self.person_hold_yaw = None
+        self.last_significant_person_center_x_error = 0.0
         self.filtered_person_center_x_error = 0.0
         self.filtered_follow_yaw_rate = 0.0
         self.previous_person_center_x_error = 0.0
@@ -197,7 +209,7 @@ class OffboardTakeoff(Node):
         """Declare ROS2 parameters for mission tuning and safety."""
 
         self.declare_parameter('control_rate_hz', 10.0)
-        self.declare_parameter('takeoff_height', 3.0)
+        self.declare_parameter('takeoff_height', 5.0)
         self.declare_parameter('max_speed', 0.8)
         self.declare_parameter('max_yaw_rate', 0.4)
         self.declare_parameter('waypoint_tolerance', 0.4)
@@ -211,7 +223,16 @@ class OffboardTakeoff(Node):
         self.declare_parameter('enable_vision', False)
         self.declare_parameter('vision_timeout_sec', 1.0)
         self.declare_parameter('enable_person_follow', True)
+        self.declare_parameter('follow_detection_confirm_sec', 1.0)
+        self.declare_parameter('follow_detection_gap_tolerance_sec', 0.5)
+        self.declare_parameter('follow_person_action_timeout_sec', 90.0)
+        self.declare_parameter('follow_stop_before_approach_sec', 1.0)
+        self.declare_parameter('follow_bbox_growth_target', 4.0)
+        self.declare_parameter('follow_hover_after_approach_sec', 5.0)
         self.declare_parameter('follow_person_timeout_sec', 1.0)
+        self.declare_parameter('follow_align_dropout_continue_sec', 1.0)
+        self.declare_parameter('follow_target_memory_activation_sec', 1.0)
+        self.declare_parameter('follow_target_memory_timeout_sec', 1.0)
         self.declare_parameter('follow_forward_speed', 0.35)
         self.declare_parameter('follow_slow_forward_speed', 0.15)
         self.declare_parameter('follow_stop_bbox_height_ratio', 0.33)
@@ -269,8 +290,35 @@ class OffboardTakeoff(Node):
         self.enable_person_follow = bool(
             self.get_parameter('enable_person_follow').value
         )
+        self.follow_detection_confirm_sec = float(
+            self.get_parameter('follow_detection_confirm_sec').value
+        )
+        self.follow_detection_gap_tolerance_sec = float(
+            self.get_parameter('follow_detection_gap_tolerance_sec').value
+        )
+        self.follow_person_action_timeout_sec = float(
+            self.get_parameter('follow_person_action_timeout_sec').value
+        )
+        self.follow_stop_before_approach_sec = float(
+            self.get_parameter('follow_stop_before_approach_sec').value
+        )
+        self.follow_bbox_growth_target = float(
+            self.get_parameter('follow_bbox_growth_target').value
+        )
+        self.follow_hover_after_approach_sec = float(
+            self.get_parameter('follow_hover_after_approach_sec').value
+        )
         self.follow_person_timeout_sec = float(
             self.get_parameter('follow_person_timeout_sec').value
+        )
+        self.follow_align_dropout_continue_sec = float(
+            self.get_parameter('follow_align_dropout_continue_sec').value
+        )
+        self.follow_target_memory_activation_sec = float(
+            self.get_parameter('follow_target_memory_activation_sec').value
+        )
+        self.follow_target_memory_timeout_sec = float(
+            self.get_parameter('follow_target_memory_timeout_sec').value
         )
         self.follow_forward_speed = float(
             self.get_parameter('follow_forward_speed').value
@@ -370,7 +418,13 @@ class OffboardTakeoff(Node):
         data = list(msg.data)
         if len(data) < 7:
             self.person_target = None
+            self.person_visible_since = None
+            self.last_person_detection_log_at = None
             return
+
+        now = self.get_clock().now()
+        if self.person_visible_since is None:
+            self.person_visible_since = now
 
         self.person_target = PersonTarget(
             confidence=float(data[0]) / 1000.0,
@@ -383,10 +437,28 @@ class OffboardTakeoff(Node):
         )
         alpha = min(max(self.follow_error_filter_alpha, 0.0), 1.0)
         raw_error = self.person_target.center_x_error
+        if abs(raw_error) > self.follow_yaw_deadband:
+            self.last_significant_person_center_x_error = raw_error
         self.filtered_person_center_x_error = (
             alpha * raw_error
             + (1.0 - alpha) * self.filtered_person_center_x_error
         )
+        if (
+            self.age_sec(self.person_visible_since)
+            >= self.follow_target_memory_activation_sec
+        ):
+            self.last_stable_person_target = self.person_target
+            self.last_stable_person_target_at = now
+        if self.last_person_detection_log_at is None:
+            self.get_logger().info(
+                'Person bbox received: '
+                f'confidence={self.person_target.confidence:.2f}, '
+                f'center=({self.person_target.center_x}, {self.person_target.center_y}), '
+                f'size={self.person_target.width}x{self.person_target.height}, '
+                f'image={self.person_target.image_width}x{self.person_target.image_height}, '
+                f'x_error={raw_error:.3f}'
+            )
+            self.last_person_detection_log_at = now
         self.mark_vision_update()
 
     def mark_vision_update(self):
@@ -430,9 +502,18 @@ class OffboardTakeoff(Node):
         }:
             self.active_waypoint_started_at = None
             self.person_follow_started_at = None
+            self.person_action_phase = ''
+            self.person_action_phase_started_at = None
+            self.person_reference_bbox_height = 0.0
+            self.person_detection_started_at = None
+            self.person_detection_lost_at = None
+            self.person_align_loss_started_at = None
+            self.person_follow_confirmation_logged = False
+            self.person_visible_since = None
             self.person_centered_since = None
             self.person_yaw_locked = False
             self.person_hold_yaw = None
+            self.last_significant_person_center_x_error = 0.0
             self.filtered_follow_yaw_rate = 0.0
             self.previous_yaw_error_sample_at = None
 
@@ -441,6 +522,11 @@ class OffboardTakeoff(Node):
 
         if new_state == MissionState.FOLLOW_PERSON:
             self.person_follow_started_at = self.get_clock().now()
+            self.person_action_phase = 'STOP_BEFORE_APPROACH'
+            self.person_action_phase_started_at = self.get_clock().now()
+            self.person_reference_bbox_height = 0.0
+            self.person_align_loss_started_at = None
+            self.person_follow_confirmation_logged = False
             self.person_centered_since = None
             self.person_yaw_locked = False
             self.person_hold_yaw = None
@@ -492,7 +578,6 @@ class OffboardTakeoff(Node):
             self.state in {
                 MissionState.TAKEOFF,
                 MissionState.SEARCH,
-                MissionState.FOLLOW_PERSON,
                 MissionState.RETURN_HOME,
             }
             and self.active_waypoint_started_at is not None
@@ -501,6 +586,16 @@ class OffboardTakeoff(Node):
         ):
             return self.handle_failure(
                 f'{self.state.value} waypoint timeout exceeded'
+            )
+
+        if (
+            self.state == MissionState.FOLLOW_PERSON
+            and self.person_follow_started_at is not None
+            and self.age_sec(self.person_follow_started_at)
+            > self.follow_person_action_timeout_sec
+        ):
+            return self.handle_failure(
+                'FOLLOW_PERSON action timeout exceeded'
             )
 
         if (
@@ -800,54 +895,101 @@ class OffboardTakeoff(Node):
             self._advance_search_or_finish()
 
     def handle_follow_person(self):
-        """Approach the detected person using conservative image cues."""
+        """Run a simple scripted person response sequence."""
 
         if self.vehicle_local_position is None:
             return
 
-        person_target = self._current_person_target()
-        if person_target is None:
+        if self.person_action_phase == 'STOP_BEFORE_APPROACH':
+            # Freeze first so the bbox we memorize comes from a stable hover.
             self._hold_current_position_target()
-            self.set_state(
-                MissionState.SEARCH,
-                'Person target timed out, returning to search',
+            if (
+                self.person_action_phase_started_at is None
+                or self.age_sec(self.person_action_phase_started_at)
+                < self.follow_stop_before_approach_sec
+            ):
+                return
+
+            self.person_action_phase = 'ALIGN_TO_TARGET'
+            self.person_action_phase_started_at = self.get_clock().now()
+            self.get_logger().info(
+                'Person action: aligning yaw to target before forward flight'
             )
             return
 
-        if self._should_stop_near_person(person_target):
+        if self.person_action_phase == 'ALIGN_TO_TARGET':
+            person_target = self._current_person_target()
+            if person_target is not None:
+                self.person_align_loss_started_at = None
+            else:
+                remembered_error = self._get_align_memory_error()
+                if remembered_error is None:
+                    self._resume_search_after_alignment_loss(
+                        'Person action: target lost during alignment, '
+                        'resuming patrol'
+                    )
+                    return
+                if self.person_align_loss_started_at is None:
+                    self.person_align_loss_started_at = self.get_clock().now()
+                elif (
+                    self.age_sec(self.person_align_loss_started_at)
+                    > self.follow_align_dropout_continue_sec
+                ):
+                    self._resume_search_after_alignment_loss(
+                        'Person action: target was not reacquired during '
+                        'alignment, resuming patrol'
+                    )
+                    return
+
+                self._align_to_person_error(remembered_error)
+                return
+
+            if abs(person_target.center_x_error) <= self.follow_yaw_deadband:
+                self.get_logger().info(
+                    'Person action: target aligned, starting forward flight'
+                )
+                self._start_bbox_growth_approach()
+                return
+
+            self._align_to_person_error(person_target.center_x_error)
+            return
+
+        if self.person_action_phase == 'APPROACH_FORWARD':
+            person_target = self._current_person_target()
+            if (
+                person_target is not None
+                and self._has_reached_bbox_growth_target(person_target)
+            ):
+                self.person_action_phase = 'HOLD_AFTER_APPROACH'
+                self.person_action_phase_started_at = self.get_clock().now()
+                self._hold_person_follow_position()
+                self.get_logger().info(
+                    'Person action: bbox reached target size, holding position'
+                )
+                return
+
+            # Keep advancing even if YOLO drops out temporarily; stop only when
+            # a fresh bbox proves the person is now much larger in frame.
+            self._step_forward_for_bbox_growth()
+            return
+
+        if self.person_action_phase == 'HOLD_AFTER_APPROACH':
             self._hold_person_follow_position()
-            self._log_person_follow_status(person_target, stopped=True)
-            return
+            if (
+                self.person_action_phase_started_at is None
+                or self.age_sec(self.person_action_phase_started_at)
+                < self.follow_hover_after_approach_sec
+            ):
+                return
 
-        if self._is_person_follow_centered():
-            self._update_person_follow_target(
-                person_target,
-                allow_forward_motion=True,
-            )
-            self._log_person_follow_status(person_target, stopped=True)
-            return
-
-        if self._is_person_follow_alignment_phase(person_target):
-            self._update_person_follow_target(
-                person_target,
-                allow_forward_motion=False,
-            )
-            self._log_person_follow_status(
-                person_target,
-                stopped=False,
-                aligning=True,
+            self._prepare_return_home_waypoint()
+            self.set_state(
+                MissionState.RETURN_HOME,
+                'Person action complete, returning home',
             )
             return
 
-        self._update_person_follow_target(
-            person_target,
-            allow_forward_motion=True,
-        )
-        self._log_person_follow_status(
-            person_target,
-            stopped=False,
-            aligning=False,
-        )
+        self._hold_current_position_target()
 
     def handle_return_home(self):
         """Fly back to the saved home position before landing."""
@@ -954,7 +1096,7 @@ class OffboardTakeoff(Node):
         )
 
     def _maybe_start_person_follow(self) -> bool:
-        """Switch from search logic into person follow when vision is ready."""
+        """Handle target confirmation or switch into person follow."""
 
         if self.state not in {MissionState.SEARCH, MissionState.HOLD}:
             return False
@@ -963,12 +1105,76 @@ class OffboardTakeoff(Node):
 
         person_target = self._current_person_target()
         if person_target is None:
+            now = self.get_clock().now()
+            if self.person_detection_started_at is None:
+                self.person_detection_lost_at = None
+                return False
+            if self.person_detection_lost_at is None:
+                self.person_detection_lost_at = now
+                return False
+            if (
+                self.age_sec(self.person_detection_lost_at)
+                <= self.follow_detection_gap_tolerance_sec
+            ):
+                return False
+
+            # A long enough dropout resets confirmation and requires a new
+            # continuous detection window before re-engaging.
+            self.person_detection_started_at = None
+            self.person_detection_lost_at = None
+            self.person_follow_confirmation_logged = False
+            self.person_reference_bbox_height = 0.0
             return False
 
+        now = self.get_clock().now()
+        if self.person_detection_started_at is None:
+            self.person_detection_started_at = now
+            self.person_follow_confirmation_logged = False
+        self.person_detection_lost_at = None
+
+        confirmed_duration = self.age_sec(self.person_detection_started_at)
+        if confirmed_duration < self.follow_detection_confirm_sec:
+            remaining_sec = max(
+                self.follow_detection_confirm_sec - confirmed_duration,
+                0.0,
+            )
+            if not self.person_follow_confirmation_logged:
+                self.get_logger().info(
+                    'Person detected, confirming target lock for %.1fs '
+                    'before visual approach'
+                    % self.follow_detection_confirm_sec
+                )
+                self.person_follow_confirmation_logged = True
+            self._hold_current_position_target()
+            if self.follow_log_period_sec > 0.0 and (
+                self.age_sec(self.last_person_follow_log_at)
+                >= self.follow_log_period_sec
+            ):
+                self.get_logger().info(
+                    'Target confirmation in progress: '
+                    f'confidence={person_target.confidence:.2f}, '
+                    f'remaining={remaining_sec:.1f}s'
+                )
+                self.last_person_follow_log_at = now
+            return True
+
         self.active_waypoint_started_at = self.get_clock().now()
+        self.person_detection_started_at = None
+        self.person_follow_confirmation_logged = False
         self.set_state(
             MissionState.FOLLOW_PERSON,
-            'Person detected, starting visual approach',
+            'Person confirmed, stopping search and starting visual approach',
+        )
+        # Remember the bbox size at the moment of confirmed detection. During
+        # the forward segment we compare new detections against this baseline.
+        self.person_reference_bbox_height = max(float(person_target.height), 1.0)
+        self.get_logger().info(
+            'Person follow engaged: '
+            f'confidence={person_target.confidence:.2f}, '
+            f'center=({person_target.center_x}, {person_target.center_y}), '
+            f'bbox_height={person_target.height}, '
+            f'height_ratio={person_target.height_ratio:.3f}, '
+            f'x_error={self.filtered_person_center_x_error:.3f}'
         )
         self._hold_current_position_target()
         return True
@@ -986,14 +1192,150 @@ class OffboardTakeoff(Node):
             return None
         return self.person_target
 
+    def _start_bbox_growth_approach(self):
+        """Start flying forward until the detected bbox grows enough."""
+        if self.person_reference_bbox_height <= 0.0:
+            person_target = self._current_person_target()
+            if person_target is None:
+                self._hold_current_position_target()
+                return
+            self.person_reference_bbox_height = max(float(person_target.height), 1.0)
+
+        self.person_action_phase = 'APPROACH_FORWARD'
+        self.person_action_phase_started_at = self.get_clock().now()
+        self.get_logger().info(
+            'Person action: flying forward until bbox height grows to %.2fx '
+            '(start_height=%d px)'
+            % (
+                self.follow_bbox_growth_target,
+                int(round(self.person_reference_bbox_height)),
+            )
+        )
+
+    def _resume_search_after_alignment_loss(self, reason: str):
+        """Return to patrol when the target cannot be reacquired in align."""
+
+        if self.current_search_waypoint is not None:
+            self.active_waypoint_started_at = self.get_clock().now()
+            self.set_state(MissionState.SEARCH, reason)
+            return
+
+        self._hold_current_position_target()
+        self.set_state(MissionState.FAILSAFE, reason)
+
+    def _has_reached_bbox_growth_target(
+        self,
+        person_target: PersonTarget,
+    ) -> bool:
+        """Return whether the tracked bbox has grown enough."""
+
+        if self.person_reference_bbox_height <= 0.0:
+            return False
+        growth_target = max(self.follow_bbox_growth_target, 1.0)
+        # Using bbox growth keeps the behavior simple: fly forward until the
+        # person appears roughly twice as large as at confirmed detection time.
+        return (
+            float(person_target.height)
+            >= self.person_reference_bbox_height * growth_target
+        )
+
+    def _step_forward_for_bbox_growth(self):
+        """Advance the target forward with a small lead so PX4 keeps moving."""
+
+        if self.vehicle_local_position is None:
+            return
+
+        heading = self.vehicle_local_position.heading
+        if not math.isfinite(heading):
+            heading = self.target.yaw
+        if not math.isfinite(heading):
+            heading = 0.0
+
+        step_distance = max(self.follow_forward_speed, 0.0) * self.control_period
+        lead_dx = self.target.x - self.vehicle_local_position.x
+        lead_dy = self.target.y - self.vehicle_local_position.y
+        lead_distance = math.hypot(lead_dx, lead_dy)
+        if lead_distance > self.follow_target_lead_limit:
+            base_x = self.vehicle_local_position.x
+            base_y = self.vehicle_local_position.y
+        else:
+            base_x = self.target.x
+            base_y = self.target.y
+
+        self.target = TargetState(
+            x=base_x + math.cos(heading) * step_distance,
+            y=base_y + math.sin(heading) * step_distance,
+            z=self.vehicle_local_position.z,
+            yaw=heading,
+        )
+
+    def _get_align_memory_error(self) -> float | None:
+        """Return the last usable horizontal error for short align recovery."""
+
+        if (
+            self.follow_target_memory_timeout_sec <= 0.0
+            or self.last_stable_person_target is None
+            or self.last_stable_person_target_at is None
+            or self.age_sec(self.last_stable_person_target_at)
+            > self.follow_target_memory_timeout_sec
+        ):
+            if abs(self.last_significant_person_center_x_error) <= (
+                self.follow_yaw_deadband
+            ):
+                return None
+            return self.last_significant_person_center_x_error
+
+        remembered_error = self.last_stable_person_target.center_x_error
+        if abs(self.last_significant_person_center_x_error) > (
+            self.follow_yaw_deadband
+        ):
+            remembered_error = self.last_significant_person_center_x_error
+        if abs(remembered_error) <= self.follow_yaw_deadband:
+            return None
+        return remembered_error
+
+    def _align_to_person_error(self, yaw_error: float):
+        """Rotate in place toward a live or remembered horizontal error."""
+
+        if self.vehicle_local_position is None:
+            return
+
+        self.person_yaw_locked = False
+        self.person_hold_yaw = None
+        self.person_centered_since = None
+
+        heading = self.vehicle_local_position.heading
+        if not math.isfinite(heading):
+            heading = self.target.yaw
+        if not math.isfinite(heading):
+            heading = 0.0
+
+        yaw_rate_cmd = self.follow_yaw_kp * yaw_error
+        yaw_rate_cmd = max(
+            min(yaw_rate_cmd, self.max_yaw_rate),
+            -self.max_yaw_rate,
+        )
+        next_yaw = self._normalize_angle(
+            heading + yaw_rate_cmd * self.control_period
+        )
+
+        self.filtered_person_center_x_error = yaw_error
+        self.previous_person_center_x_error = yaw_error
+        self.filtered_follow_yaw_rate = yaw_rate_cmd
+        self.previous_yaw_error_sample_at = self.get_clock().now()
+
+        self.target = TargetState(
+            x=self.vehicle_local_position.x,
+            y=self.vehicle_local_position.y,
+            z=self.vehicle_local_position.z,
+            yaw=next_yaw,
+        )
+
     def _should_stop_near_person(self, person_target: PersonTarget) -> bool:
-        """Stop advancing when the target appears too close or unstable."""
+        """Stop advancing when the target appears close enough."""
 
         return bool(
             person_target.height_ratio >= self.follow_stop_bbox_height_ratio
-            or person_target.left_ratio <= self.follow_frame_edge_margin_ratio
-            or person_target.right_ratio
-            >= 1.0 - self.follow_frame_edge_margin_ratio
         )
 
     def _is_person_follow_centered(self) -> bool:
@@ -1068,6 +1410,14 @@ class OffboardTakeoff(Node):
             return False
 
         alignment_error = abs(self.filtered_person_center_x_error)
+        if (
+            person_target.left_ratio <= self.follow_frame_edge_margin_ratio
+            or person_target.right_ratio
+            >= 1.0 - self.follow_frame_edge_margin_ratio
+        ):
+            self.person_centered_since = None
+            return True
+
         if alignment_error > self.follow_yaw_unlock_deadband:
             self.person_centered_since = None
             return True

@@ -175,6 +175,9 @@ def _launch_setup(context, *args, **kwargs):
         'relay_camera_info_topic'
     ).perform(context)
     yolo_model_path = LaunchConfiguration('yolo_model_path').perform(context)
+    detector_architecture = LaunchConfiguration(
+        'detector_architecture'
+    ).perform(context)
     yolo_inference_backend = LaunchConfiguration(
         'yolo_inference_backend'
     ).perform(context)
@@ -211,6 +214,11 @@ def _launch_setup(context, *args, **kwargs):
     yolo_show_fps_overlay = _as_bool(
         LaunchConfiguration('yolo_show_fps_overlay').perform(context)
     )
+    dino_resize_mode = LaunchConfiguration('dino_resize_mode').perform(context)
+    dino_box_format = LaunchConfiguration('dino_box_format').perform(context)
+    dino_logit_activation = LaunchConfiguration(
+        'dino_logit_activation'
+    ).perform(context)
 
     actions = []
     selection = None
@@ -316,6 +324,7 @@ def _launch_setup(context, *args, **kwargs):
                     {
                         'image_topic': selection['image_topic'],
                         'model_path': yolo_model_path,
+                        'model_architecture': detector_architecture,
                         'inference_backend': yolo_inference_backend,
                         'prefer_gpu': yolo_prefer_gpu,
                         'target_labels': ['person'],
@@ -331,6 +340,9 @@ def _launch_setup(context, *args, **kwargs):
                         'show_debug_window': yolo_show_debug_window,
                         'debug_view_scale': yolo_debug_view_scale,
                         'show_fps_overlay': yolo_show_fps_overlay,
+                        'dino_resize_mode': dino_resize_mode,
+                        'dino_box_format': dino_box_format,
+                        'dino_logit_activation': dino_logit_activation,
                         'use_sim_time': use_sim_time,
                     }
                 ],
@@ -444,14 +456,19 @@ def generate_launch_description() -> LaunchDescription:
                 description='Stable ROS 2 CameraInfo topic published by the viewer relay.',
             ),
             DeclareLaunchArgument(
+                'detector_architecture',
+                default_value='yolo',
+                description='Detector architecture: yolo or dino.',
+            ),
+            DeclareLaunchArgument(
                 'yolo_model_path',
-                default_value='',
-                description='Path to a YOLO ONNX model file.',
+                default_value='/home/dron/.gz/models/yolo12n_people_package/runs/yolo12n_people_v1_safe2/weights/best.pt',
+                description='Path to a detector model file (.pt or .onnx).',
             ),
             DeclareLaunchArgument(
                 'yolo_inference_backend',
-                default_value='auto',
-                description='YOLO backend: auto, onnxruntime, or opencv.',
+                default_value='ultralytics',
+                description='Detector backend: auto, ultralytics, onnxruntime, or opencv.',
             ),
             DeclareLaunchArgument(
                 'yolo_prefer_gpu',
@@ -460,33 +477,33 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 'yolo_input_width',
-                default_value='640',
-                description='YOLO model input width.',
+                default_value='960',
+                description='Detector model input width.',
             ),
             DeclareLaunchArgument(
                 'yolo_input_height',
-                default_value='640',
-                description='YOLO model input height.',
+                default_value='960',
+                description='Detector model input height.',
             ),
             DeclareLaunchArgument(
                 'yolo_confidence_threshold',
                 default_value='0.35',
-                description='Minimum confidence for YOLO detections.',
+                description='Minimum confidence for detector outputs.',
             ),
             DeclareLaunchArgument(
                 'yolo_score_threshold',
                 default_value='0.25',
-                description='Minimum raw class score for YOLO detections.',
+                description='Minimum class score for detector outputs.',
             ),
             DeclareLaunchArgument(
                 'yolo_nms_threshold',
                 default_value='0.45',
-                description='NMS threshold for YOLO detections.',
+                description='NMS threshold for detector outputs.',
             ),
             DeclareLaunchArgument(
                 'yolo_processing_max_rate_hz',
-                default_value='2.0',
-                description='Maximum YOLO inference rate.',
+                default_value='0.0',
+                description='Maximum detector inference rate.',
             ),
             DeclareLaunchArgument(
                 'yolo_diagnostic_log_period_sec',
@@ -496,17 +513,32 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 'yolo_show_debug_window',
                 default_value='true',
-                description='Show a YOLO debug window with colored bounding boxes.',
+                description='Show a detector debug window with colored bounding boxes.',
             ),
             DeclareLaunchArgument(
                 'yolo_debug_view_scale',
                 default_value='0.75',
-                description='Display scale for the YOLO debug window and debug image.',
+                description='Display scale for the detector debug window and debug image.',
             ),
             DeclareLaunchArgument(
                 'yolo_show_fps_overlay',
                 default_value='true',
-                description='Draw YOLO FPS on the debug view.',
+                description='Draw detector FPS on the debug view.',
+            ),
+            DeclareLaunchArgument(
+                'dino_resize_mode',
+                default_value='stretch',
+                description='DINO resize mode: stretch or letterbox.',
+            ),
+            DeclareLaunchArgument(
+                'dino_box_format',
+                default_value='cxcywh',
+                description='DINO bbox format: cxcywh or xyxy.',
+            ),
+            DeclareLaunchArgument(
+                'dino_logit_activation',
+                default_value='sigmoid',
+                description='Activation for DINO class logits: sigmoid, softmax, or none.',
             ),
             OpaqueFunction(function=_launch_setup),
         ]

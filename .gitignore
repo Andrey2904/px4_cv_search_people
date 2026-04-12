@@ -1,10 +1,35 @@
 build/
 install/
 log/
+
+# Python cache and test artifacts
 __pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+**/.pytest_cache/
+
+# Local editor settings
 .vscode/
 .idea/
+
+# Local environments
+.venv/
+.venv-yolo/
+env/
+venv/
 models/.venv/
-models/*.onnx
-models/*.pt
+
+# Local model files and generated model outputs
+models/
+*.pt
+*.onnx
+*.pth
+*.ckpt
+*.bin
+
+# Local tool metadata
+.codex
+.codex/

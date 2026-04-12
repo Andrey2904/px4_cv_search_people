@@ -9,6 +9,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
+from std_msgs.msg import Int32MultiArray
 
 
 ARUCO_DICTIONARIES = {
@@ -31,6 +32,8 @@ class CameraViewer(Node):
         self.declare_parameter('show_window', True)
         self.declare_parameter('log_camera_info', True)
         self.declare_parameter('enable_aruco_overlay', True)
+        self.declare_parameter('enable_target_overlay', True)
+        self.declare_parameter('target_bbox_topic', 'yolo/target_bbox')
         self.declare_parameter('aruco_dictionary', 'DICT_4X4_50')
         self.declare_parameter('draw_rejected_candidates', False)
 
@@ -51,6 +54,12 @@ class CameraViewer(Node):
         self.enable_aruco_overlay = bool(
             self.get_parameter('enable_aruco_overlay').value
         )
+        self.enable_target_overlay = bool(
+            self.get_parameter('enable_target_overlay').value
+        )
+        self.target_bbox_topic = str(
+            self.get_parameter('target_bbox_topic').value
+        )
         self.aruco_dictionary_name = str(
             self.get_parameter('aruco_dictionary').value
         )
@@ -60,6 +69,7 @@ class CameraViewer(Node):
         self.camera_info_logged = False
         self.relay_frame_count = 0
         self.last_detected_ids: tuple[int, ...] = ()
+        self.latest_target_bbox: tuple[int, int, int, int, int, int, int] | None = None
 
         self.image_publisher = self.create_publisher(
             Image,
@@ -84,6 +94,12 @@ class CameraViewer(Node):
             self.camera_info_callback,
             qos_profile_sensor_data,
         )
+        self.target_bbox_subscription = self.create_subscription(
+            Int32MultiArray,
+            self.target_bbox_topic,
+            self.target_bbox_callback,
+            10,
+        )
 
         self.aruco_dictionary = self._create_aruco_dictionary(
             self.aruco_dictionary_name
@@ -99,6 +115,7 @@ class CameraViewer(Node):
             f'out_camera_info={self.relay_camera_info_topic}, '
             f'show_window={self.show_window}, '
             f'enable_aruco_overlay={self.enable_aruco_overlay}, '
+            f'enable_target_overlay={self.enable_target_overlay}, '
             f'aruco_dictionary={self.aruco_dictionary_name}'
         )
 
@@ -161,6 +178,8 @@ class CameraViewer(Node):
         display_frame = frame.copy()
         if self.enable_aruco_overlay:
             display_frame = self.draw_aruco_overlay(display_frame)
+        if self.enable_target_overlay:
+            display_frame = self.draw_target_overlay(display_frame)
 
         if self.show_window:
             cv2.imshow('Gazebo Camera Relay', display_frame)
@@ -173,6 +192,24 @@ class CameraViewer(Node):
                 f'size={msg.width}x{msg.height}, '
                 f'frame_id={msg.header.frame_id or "<empty>"}'
             )
+
+    def target_bbox_callback(self, msg: Int32MultiArray):
+        """Store the latest target bbox for display overlays."""
+
+        data = list(msg.data)
+        if len(data) < 7:
+            self.latest_target_bbox = None
+            return
+
+        self.latest_target_bbox = (
+            int(data[0]),
+            int(data[1]),
+            int(data[2]),
+            int(data[3]),
+            int(data[4]),
+            max(int(data[5]), 1),
+            max(int(data[6]), 1),
+        )
 
     def draw_aruco_overlay(self, frame: np.ndarray) -> np.ndarray:
         """Detect ArUco markers and draw their outlines and IDs."""
@@ -220,6 +257,68 @@ class CameraViewer(Node):
                 )
             self.last_detected_ids = detected_ids
 
+        return frame
+
+    def draw_target_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """Draw the latest detector target over the camera preview."""
+
+        if self.latest_target_bbox is None:
+            return frame
+
+        confidence_milli, center_x, center_y, width, height, _, _ = (
+            self.latest_target_bbox
+        )
+        if width <= 1 or height <= 1:
+            return frame
+
+        x1 = max(int(round(center_x - width / 2.0)), 0)
+        y1 = max(int(round(center_y - height / 2.0)), 0)
+        x2 = min(int(round(center_x + width / 2.0)), frame.shape[1] - 1)
+        y2 = min(int(round(center_y + height / 2.0)), frame.shape[0] - 1)
+        if x2 <= x1 or y2 <= y1:
+            return frame
+
+        color = (0, 0, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        cv2.circle(frame, (center_x, center_y), 4, color, -1)
+
+        label = f'PERSON {confidence_milli / 1000.0:.2f}'
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 2
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label,
+            font,
+            font_scale,
+            thickness,
+        )
+        badge_x1 = x1
+        badge_y2 = max(y1 - 6, text_height + baseline + 8)
+        badge_y1 = max(badge_y2 - text_height - baseline - 10, 0)
+        badge_x2 = min(
+            badge_x1 + text_width + 14,
+            frame.shape[1] - 1,
+        )
+
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (badge_x1, badge_y1),
+            (badge_x2, badge_y2),
+            color,
+            -1,
+        )
+        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0.0, frame)
+        cv2.putText(
+            frame,
+            label,
+            (badge_x1 + 7, badge_y2 - baseline - 4),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
         return frame
 
     def detect_markers(self, gray_frame: np.ndarray):

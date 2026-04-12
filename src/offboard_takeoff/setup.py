@@ -36,6 +36,8 @@ setup(
         'console_scripts': [
             'aruco_detector = offboard_takeoff.aruco_detector:main',
             'camera_viewer = offboard_takeoff.camera_viewer:main',
+            'dino_detector = offboard_takeoff.yolo_detector:main',
+            'grounding_dino_detector = offboard_takeoff.grounding_dino_detector:main',
             'offboard_takeoff = offboard_takeoff.offboard_takeoff:main',
             'yolo_detector = offboard_takeoff.yolo_detector:main',
         ],

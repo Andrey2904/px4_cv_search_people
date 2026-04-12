@@ -1,0 +1,7 @@
+path: /home/dron/.gz/models/datasets/dino_autolabel_combined_annotation_pool_20260407_tuned_split
+train: train/images
+val: test/images
+test: test/images
+
+names:
+  0: person

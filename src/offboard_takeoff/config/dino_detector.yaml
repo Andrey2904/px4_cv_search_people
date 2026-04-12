@@ -1,14 +1,13 @@
-yolo_detector:
+dino_detector:
   ros__parameters:
     use_sim_time: true
     image_topic: /camera/image_raw
-    model_path: /home/dron/.gz/models/yolo12n_people_package/runs/yolo12n_people_v1_safe2/weights/best.pt
-    model_architecture: yolo
-    inference_backend: ultralytics
+    model_path: ''
+    model_architecture: dino
     target_labels:
       - person
-    input_width: 960
-    input_height: 960
+    input_width: 640
+    input_height: 640
     confidence_threshold: 0.35
     score_threshold: 0.25
     nms_threshold: 0.45
