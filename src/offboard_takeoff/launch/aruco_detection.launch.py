@@ -1,4 +1,4 @@
-"""Launch only the Gazebo to ROS 2 camera bridge and optional viewer relay."""
+"""Launch the Gazebo camera bridge, viewer relay, and optional detector."""
 
 from __future__ import annotations
 
@@ -152,13 +152,6 @@ def _launch_setup(context, *args, **kwargs):
     log_camera_info = _as_bool(
         LaunchConfiguration('log_camera_info').perform(context)
     )
-    enable_aruco_overlay = _as_bool(
-        LaunchConfiguration('enable_aruco_overlay').perform(context)
-    )
-    draw_rejected_candidates = _as_bool(
-        LaunchConfiguration('draw_rejected_candidates').perform(context)
-    )
-    aruco_dictionary = LaunchConfiguration('aruco_dictionary').perform(context)
     model_regex = LaunchConfiguration('model_regex').perform(context)
     attempts = int(
         LaunchConfiguration('topic_discovery_attempts').perform(context)
@@ -298,9 +291,6 @@ def _launch_setup(context, *args, **kwargs):
                         'relay_camera_info_topic': relay_camera_info_topic,
                         'show_window': show_viewer_window,
                         'log_camera_info': log_camera_info,
-                        'enable_aruco_overlay': enable_aruco_overlay,
-                        'draw_rejected_candidates': draw_rejected_candidates,
-                        'aruco_dictionary': aruco_dictionary,
                         'use_sim_time': use_sim_time,
                     }
                 ],
@@ -359,7 +349,7 @@ def _launch_setup(context, *args, **kwargs):
 
 
 def generate_launch_description() -> LaunchDescription:
-    """Create the ROS 2 launch description for the camera bridge."""
+    """Create the ROS 2 launch description for person-search vision."""
 
     return LaunchDescription(
         [
@@ -390,21 +380,6 @@ def generate_launch_description() -> LaunchDescription:
                 'log_camera_info',
                 default_value='true',
                 description='Log the first CameraInfo message for debugging.',
-            ),
-            DeclareLaunchArgument(
-                'enable_aruco_overlay',
-                default_value='false',
-                description='Draw simple ArUco detections in the viewer window.',
-            ),
-            DeclareLaunchArgument(
-                'aruco_dictionary',
-                default_value='DICT_4X4_50',
-                description='OpenCV ArUco dictionary name used by the viewer.',
-            ),
-            DeclareLaunchArgument(
-                'draw_rejected_candidates',
-                default_value='false',
-                description='Also draw rejected ArUco candidates in red.',
             ),
             DeclareLaunchArgument(
                 'bridge_clock',

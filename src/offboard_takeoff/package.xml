@@ -3,7 +3,7 @@
 <package format="3">
   <name>offboard_takeoff</name>
   <version>0.0.0</version>
-  <description>PX4 offboard mission helpers and ArUco detection for Gazebo SITL</description>
+  <description>PX4 offboard mission helpers and person detection for Gazebo SITL</description>
   <maintainer email="dron@example.com">dron</maintainer>
   <license>Apache-2.0</license>
 
@@ -11,9 +11,6 @@
   <depend>px4_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>visualization_msgs</depend>
-  <depend>tf2_ros</depend>
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
@@ -21,7 +18,6 @@
   <exec_depend>rosgraph_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
-  <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

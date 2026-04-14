@@ -15,7 +15,7 @@ def generate_launch_description() -> LaunchDescription:
     shared_launch = PythonLaunchDescriptionSource(
         [
             FindPackageShare('offboard_takeoff'),
-            '/launch/aruco_detection.launch.py',
+            '/launch/person_detection.launch.py',
         ]
     )
 

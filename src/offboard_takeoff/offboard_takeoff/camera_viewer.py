@@ -1,4 +1,4 @@
-"""ROS 2 camera viewer, relay, and simple ArUco overlay detector."""
+"""ROS 2 camera viewer and relay with YOLO target overlay."""
 
 from __future__ import annotations
 
@@ -10,14 +10,6 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
 from std_msgs.msg import Int32MultiArray
-
-
-ARUCO_DICTIONARIES = {
-    name: getattr(cv2.aruco, name)
-    for name in dir(cv2.aruco)
-    if name.startswith('DICT_')
-}
-
 
 class CameraViewer(Node):
     """Subscribe to a camera stream, optionally display it, and relay it."""
@@ -31,11 +23,8 @@ class CameraViewer(Node):
         self.declare_parameter('relay_camera_info_topic', '/camera/camera_info')
         self.declare_parameter('show_window', True)
         self.declare_parameter('log_camera_info', True)
-        self.declare_parameter('enable_aruco_overlay', True)
         self.declare_parameter('enable_target_overlay', True)
         self.declare_parameter('target_bbox_topic', 'yolo/target_bbox')
-        self.declare_parameter('aruco_dictionary', 'DICT_4X4_50')
-        self.declare_parameter('draw_rejected_candidates', False)
 
         self.image_topic = str(self.get_parameter('image_topic').value)
         self.camera_info_topic = str(
@@ -51,24 +40,14 @@ class CameraViewer(Node):
         self.log_camera_info = bool(
             self.get_parameter('log_camera_info').value
         )
-        self.enable_aruco_overlay = bool(
-            self.get_parameter('enable_aruco_overlay').value
-        )
         self.enable_target_overlay = bool(
             self.get_parameter('enable_target_overlay').value
         )
         self.target_bbox_topic = str(
             self.get_parameter('target_bbox_topic').value
         )
-        self.aruco_dictionary_name = str(
-            self.get_parameter('aruco_dictionary').value
-        )
-        self.draw_rejected_candidates = bool(
-            self.get_parameter('draw_rejected_candidates').value
-        )
         self.camera_info_logged = False
         self.relay_frame_count = 0
-        self.last_detected_ids: tuple[int, ...] = ()
         self.latest_target_bbox: tuple[int, int, int, int, int, int, int] | None = None
 
         self.image_publisher = self.create_publisher(
@@ -101,12 +80,6 @@ class CameraViewer(Node):
             10,
         )
 
-        self.aruco_dictionary = self._create_aruco_dictionary(
-            self.aruco_dictionary_name
-        )
-        self.aruco_parameters = self._create_aruco_parameters()
-        self.aruco_detector = self._create_aruco_detector()
-
         self.get_logger().info(
             'Camera viewer relay started: '
             f'in_image={self.image_topic}, '
@@ -114,41 +87,8 @@ class CameraViewer(Node):
             f'out_image={self.relay_image_topic}, '
             f'out_camera_info={self.relay_camera_info_topic}, '
             f'show_window={self.show_window}, '
-            f'enable_aruco_overlay={self.enable_aruco_overlay}, '
-            f'enable_target_overlay={self.enable_target_overlay}, '
-            f'aruco_dictionary={self.aruco_dictionary_name}'
+            f'enable_target_overlay={self.enable_target_overlay}'
         )
-
-    def _create_aruco_dictionary(self, dictionary_name: str):
-        """Create the configured OpenCV ArUco dictionary."""
-
-        if dictionary_name not in ARUCO_DICTIONARIES:
-            supported = ', '.join(sorted(ARUCO_DICTIONARIES))
-            raise ValueError(
-                f'Unsupported ArUco dictionary "{dictionary_name}". '
-                f'Available dictionaries: {supported}'
-            )
-
-        return cv2.aruco.getPredefinedDictionary(
-            ARUCO_DICTIONARIES[dictionary_name]
-        )
-
-    def _create_aruco_parameters(self):
-        """Build OpenCV ArUco detector parameters."""
-
-        if hasattr(cv2.aruco, 'DetectorParameters'):
-            return cv2.aruco.DetectorParameters()
-        return cv2.aruco.DetectorParameters_create()
-
-    def _create_aruco_detector(self):
-        """Instantiate the modern ArUco detector API when available."""
-
-        if hasattr(cv2.aruco, 'ArucoDetector'):
-            return cv2.aruco.ArucoDetector(
-                self.aruco_dictionary,
-                self.aruco_parameters,
-            )
-        return None
 
     def camera_info_callback(self, msg: CameraInfo):
         """Relay camera calibration and log it once for debugging."""
@@ -176,8 +116,6 @@ class CameraViewer(Node):
             return
 
         display_frame = frame.copy()
-        if self.enable_aruco_overlay:
-            display_frame = self.draw_aruco_overlay(display_frame)
         if self.enable_target_overlay:
             display_frame = self.draw_target_overlay(display_frame)
 
@@ -210,54 +148,6 @@ class CameraViewer(Node):
             max(int(data[5]), 1),
             max(int(data[6]), 1),
         )
-
-    def draw_aruco_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Detect ArUco markers and draw their outlines and IDs."""
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, rejected = self.detect_markers(gray)
-
-        detected_ids: tuple[int, ...] = ()
-        if ids is not None and len(ids) > 0:
-            detected_ids = tuple(sorted(int(marker_id[0]) for marker_id in ids))
-            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-
-            for marker_corners, marker_id_array in zip(corners, ids):
-                marker_id = int(marker_id_array[0])
-                center = np.mean(
-                    marker_corners.reshape(4, 2),
-                    axis=0,
-                ).astype(int)
-                cv2.putText(
-                    frame,
-                    f'id={marker_id}',
-                    (int(center[0] + 10), int(center[1])),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-        if self.draw_rejected_candidates and rejected:
-            cv2.aruco.drawDetectedMarkers(
-                frame,
-                rejected,
-                borderColor=(0, 0, 255),
-            )
-
-        if detected_ids != self.last_detected_ids:
-            if detected_ids:
-                self.get_logger().info(
-                    f'Detected ArUco markers in viewer: {list(detected_ids)}'
-                )
-            elif self.last_detected_ids:
-                self.get_logger().info(
-                    'Viewer lost sight of all ArUco markers'
-                )
-            self.last_detected_ids = detected_ids
-
-        return frame
 
     def draw_target_overlay(self, frame: np.ndarray) -> np.ndarray:
         """Draw the latest detector target over the camera preview."""
@@ -320,18 +210,6 @@ class CameraViewer(Node):
             cv2.LINE_AA,
         )
         return frame
-
-    def detect_markers(self, gray_frame: np.ndarray):
-        """Run OpenCV ArUco detection using the available API."""
-
-        if self.aruco_detector is not None:
-            return self.aruco_detector.detectMarkers(gray_frame)
-
-        return cv2.aruco.detectMarkers(
-            gray_frame,
-            self.aruco_dictionary,
-            parameters=self.aruco_parameters,
-        )
 
     def image_to_bgr(self, msg: Image) -> np.ndarray | None:
         """Convert sensor_msgs/Image to an OpenCV BGR frame."""

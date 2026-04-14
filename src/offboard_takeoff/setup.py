@@ -30,11 +30,10 @@ setup(
     zip_safe=True,
     maintainer='dron',
     maintainer_email='dron@example.com',
-    description='PX4 offboard mission and ArUco tools for Gazebo SITL',
+    description='PX4 offboard mission and person-search tools for Gazebo SITL',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'aruco_detector = offboard_takeoff.aruco_detector:main',
             'camera_viewer = offboard_takeoff.camera_viewer:main',
             'dino_detector = offboard_takeoff.yolo_detector:main',
             'grounding_dino_detector = offboard_takeoff.grounding_dino_detector:main',
