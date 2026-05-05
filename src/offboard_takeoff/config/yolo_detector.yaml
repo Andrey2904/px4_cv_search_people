@@ -2,7 +2,7 @@ yolo_detector:
   ros__parameters:
     use_sim_time: true
     image_topic: /camera/image_raw
-    model_path: /home/dron/.gz/models/yolo12n_people_package/runs/yolo12n_people_v1_safe2/weights/best.pt
+    model_path: /home/dron/.gz/models/yolo12n_people_package/runs/yolo12s_people_e30_b62/weights/best.pt
     model_architecture: yolo
     inference_backend: ultralytics
     target_labels:

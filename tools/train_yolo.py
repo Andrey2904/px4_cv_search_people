@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="yolo12n.pt",
+        default="yolo12s.pt",
         help="Base checkpoint name or path.",
     )
     parser.add_argument("--imgsz", type=int, default=960)
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/home/dron/px4_offboard_clean_ws/models/yolo_runs"),
     )
-    parser.add_argument("--name", default="yolo12n_person_detector_v1")
+    parser.add_argument("--name", default="yolo12s_person_detector_v1")
     parser.add_argument("--cache", default="disk")
     parser.add_argument("--optimizer", default="auto")
     parser.add_argument("--seed", type=int, default=42)

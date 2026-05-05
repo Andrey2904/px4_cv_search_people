@@ -1,4 +1,4 @@
-# PX4 SITL Person Search with YOLO12n for `gz_x500_mono_cam`
+# PX4 SITL Person Search with YOLO12s for `gz_x500_mono_cam`
 
 This workspace contains ROS 2 Python tools for a PX4 Gazebo GZ quadcopter
 used in a search-and-rescue style simulation scenario.
@@ -7,11 +7,12 @@ What the current project does:
 - runs a PX4 offboard mission in ROS 2;
 - flies a snake-style search route over the target area;
 - receives real camera images from the drone through `ros_gz_bridge`;
-- detects people from the onboard camera with `YOLO12n`;
+- detects people from the onboard camera with a fine-tuned `YOLO12s`;
 - publishes the best person bounding box to ROS 2 topics;
 - overlays the latest person detection in a relay viewer;
 - performs a scripted visual response after target confirmation;
-- returns home and lands after the person-approach stage.
+- can teleport an evacuated person out of the Gazebo scene;
+- continues the snake search for other people after evacuation.
 
 ## Main packages
 
@@ -64,7 +65,7 @@ source install/setup.bash
 ros2 launch offboard_takeoff person_detection.launch.py \
   start_yolo:=true \
   detector_architecture:=yolo \
-  yolo_model_path:=/home/dron/.gz/models/yolo12n_people_package/runs/yolo12n_people_v1_safe2/weights/best.pt \
+  yolo_model_path:=/home/dron/.gz/models/yolo12n_people_package/runs/yolo12s_people_e30_b62/weights/best.pt \
   yolo_inference_backend:=ultralytics \
   yolo_input_width:=960 \
   yolo_input_height:=960
@@ -77,7 +78,7 @@ This launch file:
 - optionally starts the detector node.
 
 If the detector model path is empty, the node first tries the trained
-`YOLO12n` checkpoint in `/home/dron/.gz/models/yolo12n_people_package/...`
+`YOLO12s` checkpoint in `/home/dron/.gz/models/yolo12n_people_package/...`
 and then falls back to the newest local model from `models/yolo_runs`.
 
 ## Mission logic
@@ -102,12 +103,14 @@ The default mission:
 - flies a snake-style search route across the area;
 - waits for a confirmed person detection;
 - performs a visual approach sequence;
-- returns to the saved home point;
-- lands via PX4.
+- publishes a `mission/person_rescued` event;
+- teleports the nearest person model out of the Gazebo world;
+- resumes the search route for remaining people;
+- returns home and lands after the route finishes.
 
 ## Person response logic
 
-After `YOLO12n` detects a person, the mission node runs the following logic:
+After `YOLO12s` detects a person, the mission node runs the following logic:
 
 1. the person bbox must remain visible for `follow_detection_confirm_sec`;
 2. if the detection drops for too long, confirmation resets;
@@ -116,19 +119,31 @@ After `YOLO12n` detects a person, the mission node runs the following logic:
 5. it memorizes the initial bbox height;
 6. it flies forward while the bbox grows in the image;
 7. once the target appears large enough, the drone holds position;
-8. it then returns home and lands.
+8. it marks the person as evacuated;
+9. the scene map teleports the nearest person model away with `gz service`;
+10. the drone ignores detections briefly and resumes the search route.
 
 Key parameters live in:
 - `src/offboard_takeoff/offboard_takeoff/node.py`
 - `src/offboard_takeoff/config/yolo_detector.yaml`
 
 Most important mission parameters:
+- `resume_search_after_rescue`
+- `post_rescue_detection_cooldown_sec`
 - `follow_detection_confirm_sec`
 - `follow_detection_gap_tolerance_sec`
 - `follow_stop_before_approach_sec`
 - `follow_bbox_growth_target`
 - `follow_forward_speed`
 - `follow_hover_after_approach_sec`
+
+Scene-map rescue parameters:
+- `teleport_rescued_people`
+- `hide_rescued_people`
+- `teleport_world_name`
+- `rescued_person_teleport_x`
+- `rescued_person_teleport_y`
+- `rescued_person_teleport_z`
 
 ## Detector options
 

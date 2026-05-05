@@ -437,7 +437,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 'yolo_model_path',
-                default_value='/home/dron/.gz/models/yolo12n_people_package/runs/yolo12n_people_v1_safe2/weights/best.pt',
+                default_value='/home/dron/.gz/models/yolo12n_people_package/runs/yolo12s_people_e30_b62/weights/best.pt',
                 description='Path to a detector model file (.pt or .onnx).',
             ),
             DeclareLaunchArgument(

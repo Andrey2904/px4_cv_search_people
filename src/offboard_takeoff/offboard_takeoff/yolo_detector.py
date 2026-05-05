@@ -144,6 +144,14 @@ COCO_CLASS_NAMES = (
 
 DEFAULT_EXTERNAL_MODEL_CANDIDATES = (
     Path('/home/dron/.gz/models/yolo12n_people_package/runs')
+    / 'yolo12s_people_e30_b62'
+    / 'weights'
+    / 'best.pt',
+    Path('/home/dron/.gz/models/yolo12n_people_package/runs')
+    / 'yolo12s_people_e30_b62'
+    / 'weights'
+    / 'last.pt',
+    Path('/home/dron/.gz/models/yolo12n_people_package/runs')
     / 'yolo12n_people_v1_safe2'
     / 'weights'
     / 'best.pt',

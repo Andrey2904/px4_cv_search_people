@@ -38,6 +38,8 @@ setup(
             'dino_detector = offboard_takeoff.yolo_detector:main',
             'grounding_dino_detector = offboard_takeoff.grounding_dino_detector:main',
             'offboard_takeoff = offboard_takeoff.offboard_takeoff:main',
+            'scene_map_publisher = offboard_takeoff.scene_map_publisher:main',
+            'top_down_map_viewer = offboard_takeoff.top_down_map_viewer:main',
             'yolo_detector = offboard_takeoff.yolo_detector:main',
         ],
     },

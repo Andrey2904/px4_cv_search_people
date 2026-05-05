@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import math
+import subprocess
 
 from px4_msgs.msg import OffboardControlMode
 from px4_msgs.msg import TrajectorySetpoint
@@ -14,6 +15,7 @@ from rclpy.qos import DurabilityPolicy
 from rclpy.qos import HistoryPolicy
 from rclpy.qos import QoSProfile
 from rclpy.qos import ReliabilityPolicy
+from std_msgs.msg import Float32MultiArray
 from std_msgs.msg import Int32MultiArray
 
 from offboard_takeoff.mission import MissionPlan
@@ -23,6 +25,8 @@ from offboard_takeoff.navigation import TargetState
 from offboard_takeoff.navigation import is_position_reached
 from offboard_takeoff.navigation import is_yaw_reached
 from offboard_takeoff.navigation import smooth_target_towards_waypoint
+from offboard_takeoff.path_planner import EvacuationRoutePlanner
+from offboard_takeoff.path_planner import PlannerConfig
 
 
 class MissionState(Enum):
@@ -99,6 +103,16 @@ class PersonTarget:
             float(self.center_x) + float(self.width) / 2.0
         ) / float(self.image_width)
 
+    @property
+    def bottom_ratio(self) -> float:
+        """Bottom bbox edge normalized by image height."""
+
+        if self.image_height <= 0:
+            return 1.0
+        return (
+            float(self.center_y) + float(self.height) / 2.0
+        ) / float(self.image_height)
+
 
 class OffboardTakeoff(Node):
     """Run a PX4 offboard mission through explicit mission states."""
@@ -118,6 +132,8 @@ class OffboardTakeoff(Node):
         self.vehicle_status: VehicleStatus | None = None
         self.home_position: Waypoint | None = None
         self.return_home_waypoint: Waypoint | None = None
+        self.evacuation_route_waypoints: list[Waypoint] = []
+        self.evacuation_route_index = 0
         self.person_target: PersonTarget | None = None
         self.last_stable_person_target: PersonTarget | None = None
 
@@ -131,12 +147,20 @@ class OffboardTakeoff(Node):
         self.last_person_follow_log_at = self.node_started_at
         self.last_person_detection_log_at = None
         self.person_follow_started_at = None
+        self.person_detection_ignore_until = None
+        self.pending_search_resume_after_home = False
+        self.pending_teleport_after_home = False
+        self.rescue_model_teleported = False
+        self.resume_search_waypoint_index = None
         self.person_action_phase = ''
         self.person_action_phase_started_at = None
         self.person_reference_bbox_height = 0.0
         self.person_detection_started_at = None
         self.person_detection_lost_at = None
         self.person_align_loss_started_at = None
+        self.person_approach_loss_started_at = None
+        self.last_approach_person_target: PersonTarget | None = None
+        self.last_approach_person_target_at = None
         self.person_follow_confirmation_logged = False
         self.person_visible_since = None
         self.last_stable_person_target_at = None
@@ -174,7 +198,11 @@ class OffboardTakeoff(Node):
             '/fmu/in/vehicle_command',
             10,
         )
-
+        self.evacuation_route_pub = self.create_publisher(
+            Float32MultiArray,
+            'mission/evacuation_route',
+            10,
+        )
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -209,9 +237,12 @@ class OffboardTakeoff(Node):
         """Declare ROS2 parameters for mission tuning and safety."""
 
         self.declare_parameter('control_rate_hz', 10.0)
-        self.declare_parameter('takeoff_height', 5.0)
-        self.declare_parameter('max_speed', 0.8)
-        self.declare_parameter('max_yaw_rate', 0.4)
+        self.declare_parameter('takeoff_height', 7.0)
+        self.declare_parameter('max_speed', 1.5)
+        # Previous tuning: max_yaw_rate=0.4, follow_yaw_kp=0.9,
+        # follow_align_dropout_continue_sec=1.0,
+        # follow_target_memory_timeout_sec=1.0.
+        self.declare_parameter('max_yaw_rate', 0.5)
         self.declare_parameter('waypoint_tolerance', 0.4)
         self.declare_parameter('yaw_tolerance', 0.3)
         self.declare_parameter('px4_data_timeout_sec', 1.0)
@@ -223,24 +254,35 @@ class OffboardTakeoff(Node):
         self.declare_parameter('enable_vision', False)
         self.declare_parameter('vision_timeout_sec', 1.0)
         self.declare_parameter('enable_person_follow', True)
+        self.declare_parameter('follow_min_confidence', 0.50)
         self.declare_parameter('follow_detection_confirm_sec', 1.0)
         self.declare_parameter('follow_detection_gap_tolerance_sec', 0.5)
+        self.declare_parameter('post_rescue_detection_cooldown_sec', 5.0)
+        self.declare_parameter('rescue_model_name', 'man_3')
+        self.declare_parameter('rescue_model_teleport_x', 36.57)
+        self.declare_parameter('rescue_model_teleport_y', 28.2)
+        self.declare_parameter('rescue_model_teleport_z', -10.0)
+        self.declare_parameter('rescue_service_timeout_ms', 2000)
+        self.declare_parameter('teleport_world_name', 'forest')
         self.declare_parameter('follow_person_action_timeout_sec', 90.0)
         self.declare_parameter('follow_stop_before_approach_sec', 1.0)
         self.declare_parameter('follow_bbox_growth_target', 4.0)
         self.declare_parameter('follow_hover_after_approach_sec', 5.0)
         self.declare_parameter('follow_person_timeout_sec', 1.0)
-        self.declare_parameter('follow_align_dropout_continue_sec', 1.0)
+        self.declare_parameter('follow_align_dropout_continue_sec', 1.5)
         self.declare_parameter('follow_target_memory_activation_sec', 1.0)
-        self.declare_parameter('follow_target_memory_timeout_sec', 1.0)
+        self.declare_parameter('follow_target_memory_timeout_sec', 1.5)
         self.declare_parameter('follow_forward_speed', 0.35)
         self.declare_parameter('follow_slow_forward_speed', 0.15)
         self.declare_parameter('follow_stop_bbox_height_ratio', 0.33)
         self.declare_parameter('follow_slow_bbox_height_ratio', 0.22)
         self.declare_parameter('follow_frame_edge_margin_ratio', 0.08)
-        self.declare_parameter('follow_yaw_kp', 0.9)
+        self.declare_parameter('follow_bottom_edge_margin_ratio', 0.08)
+        self.declare_parameter('follow_approach_dropout_stop_sec', 0.5)
+        self.declare_parameter('follow_approach_max_sec', 12.0)
+        self.declare_parameter('follow_yaw_kp', 0.8)
         self.declare_parameter('follow_yaw_kd', 0.0)
-        self.declare_parameter('follow_yaw_deadband', 0.05)
+        self.declare_parameter('follow_yaw_deadband', 0.05)  # Previous: 0.05.
         self.declare_parameter('follow_yaw_unlock_deadband', 0.12)
         self.declare_parameter('follow_yaw_rate_filter_alpha', 0.35)
         self.declare_parameter('follow_lateral_gain', 0.35)
@@ -250,6 +292,18 @@ class OffboardTakeoff(Node):
         self.declare_parameter('follow_alignment_hold_sec', 1.0)
         self.declare_parameter('follow_centered_hold_sec', 0.35)
         self.declare_parameter('follow_error_filter_alpha', 0.25)
+        self.declare_parameter('enable_evacuation_astar', True)
+        self.declare_parameter(
+            'evacuation_world_sdf_path',
+            '/home/dron/PX4-Autopilot/Tools/simulation/gz/worlds/forest.sdf',
+        )
+        self.declare_parameter('evacuation_grid_resolution', 1.0)
+        self.declare_parameter('evacuation_obstacle_margin', 3.0)
+        self.declare_parameter('evacuation_map_padding', 8.0)
+        self.declare_parameter('evacuation_waypoint_spacing', 3.0)
+        self.declare_parameter('evacuation_mission_rotation_deg', 90.0)
+        self.declare_parameter('evacuation_mission_invert_y', True)
+        self.declare_parameter('evacuation_max_iterations', 20000)
 
     def _load_parameters(self):
         """Load ROS2 parameters into node fields."""
@@ -290,12 +344,37 @@ class OffboardTakeoff(Node):
         self.enable_person_follow = bool(
             self.get_parameter('enable_person_follow').value
         )
+        self.follow_min_confidence = float(
+            self.get_parameter('follow_min_confidence').value
+        )
         self.follow_detection_confirm_sec = float(
             self.get_parameter('follow_detection_confirm_sec').value
         )
         self.follow_detection_gap_tolerance_sec = float(
             self.get_parameter('follow_detection_gap_tolerance_sec').value
         )
+        self.post_rescue_detection_cooldown_sec = float(
+            self.get_parameter('post_rescue_detection_cooldown_sec').value
+        )
+        self.rescue_model_name = str(
+            self.get_parameter('rescue_model_name').value
+        ).strip()
+        self.rescue_model_teleport_x = float(
+            self.get_parameter('rescue_model_teleport_x').value
+        )
+        self.rescue_model_teleport_y = float(
+            self.get_parameter('rescue_model_teleport_y').value
+        )
+        self.rescue_model_teleport_z = float(
+            self.get_parameter('rescue_model_teleport_z').value
+        )
+        self.rescue_service_timeout_ms = max(
+            int(self.get_parameter('rescue_service_timeout_ms').value),
+            100,
+        )
+        self.teleport_world_name = str(
+            self.get_parameter('teleport_world_name').value
+        ).strip()
         self.follow_person_action_timeout_sec = float(
             self.get_parameter('follow_person_action_timeout_sec').value
         )
@@ -335,6 +414,15 @@ class OffboardTakeoff(Node):
         self.follow_frame_edge_margin_ratio = float(
             self.get_parameter('follow_frame_edge_margin_ratio').value
         )
+        self.follow_bottom_edge_margin_ratio = float(
+            self.get_parameter('follow_bottom_edge_margin_ratio').value
+        )
+        self.follow_approach_dropout_stop_sec = float(
+            self.get_parameter('follow_approach_dropout_stop_sec').value
+        )
+        self.follow_approach_max_sec = float(
+            self.get_parameter('follow_approach_max_sec').value
+        )
         self.follow_yaw_kp = float(
             self.get_parameter('follow_yaw_kp').value
         )
@@ -370,6 +458,33 @@ class OffboardTakeoff(Node):
         )
         self.follow_error_filter_alpha = float(
             self.get_parameter('follow_error_filter_alpha').value
+        )
+        self.enable_evacuation_astar = bool(
+            self.get_parameter('enable_evacuation_astar').value
+        )
+        self.evacuation_world_sdf_path = str(
+            self.get_parameter('evacuation_world_sdf_path').value
+        ).strip()
+        self.evacuation_grid_resolution = float(
+            self.get_parameter('evacuation_grid_resolution').value
+        )
+        self.evacuation_obstacle_margin = float(
+            self.get_parameter('evacuation_obstacle_margin').value
+        )
+        self.evacuation_map_padding = float(
+            self.get_parameter('evacuation_map_padding').value
+        )
+        self.evacuation_waypoint_spacing = float(
+            self.get_parameter('evacuation_waypoint_spacing').value
+        )
+        self.evacuation_mission_rotation_deg = float(
+            self.get_parameter('evacuation_mission_rotation_deg').value
+        )
+        self.evacuation_mission_invert_y = bool(
+            self.get_parameter('evacuation_mission_invert_y').value
+        )
+        self.evacuation_max_iterations = int(
+            self.get_parameter('evacuation_max_iterations').value
         )
 
     @property
@@ -453,9 +568,13 @@ class OffboardTakeoff(Node):
             self.get_logger().info(
                 'Person bbox received: '
                 f'confidence={self.person_target.confidence:.2f}, '
-                f'center=({self.person_target.center_x}, {self.person_target.center_y}), '
-                f'size={self.person_target.width}x{self.person_target.height}, '
-                f'image={self.person_target.image_width}x{self.person_target.image_height}, '
+                'center=('
+                f'{self.person_target.center_x}, '
+                f'{self.person_target.center_y}), '
+                f'size={self.person_target.width}x'
+                f'{self.person_target.height}, '
+                f'image={self.person_target.image_width}x'
+                f'{self.person_target.image_height}, '
                 f'x_error={raw_error:.3f}'
             )
             self.last_person_detection_log_at = now
@@ -508,6 +627,9 @@ class OffboardTakeoff(Node):
             self.person_detection_started_at = None
             self.person_detection_lost_at = None
             self.person_align_loss_started_at = None
+            self.person_approach_loss_started_at = None
+            self.last_approach_person_target = None
+            self.last_approach_person_target_at = None
             self.person_follow_confirmation_logged = False
             self.person_visible_since = None
             self.person_centered_since = None
@@ -526,6 +648,9 @@ class OffboardTakeoff(Node):
             self.person_action_phase_started_at = self.get_clock().now()
             self.person_reference_bbox_height = 0.0
             self.person_align_loss_started_at = None
+            self.person_approach_loss_started_at = None
+            self.last_approach_person_target = None
+            self.last_approach_person_target_at = None
             self.person_follow_confirmation_logged = False
             self.person_centered_since = None
             self.person_yaw_locked = False
@@ -956,20 +1081,48 @@ class OffboardTakeoff(Node):
 
         if self.person_action_phase == 'APPROACH_FORWARD':
             person_target = self._current_person_target()
+            if person_target is not None:
+                self.person_approach_loss_started_at = None
+                self.last_approach_person_target = person_target
+                self.last_approach_person_target_at = self.get_clock().now()
+
+            if self._has_approach_forward_timed_out():
+                self._finish_bbox_growth_approach(
+                    'Person action: forward approach timeout, '
+                    'holding position'
+                )
+                return
+
             if (
                 person_target is not None
                 and self._has_reached_bbox_growth_target(person_target)
             ):
-                self.person_action_phase = 'HOLD_AFTER_APPROACH'
-                self.person_action_phase_started_at = self.get_clock().now()
-                self._hold_person_follow_position()
-                self.get_logger().info(
-                    'Person action: bbox reached target size, holding position'
+                self._finish_bbox_growth_approach(
+                    'Person action: bbox reached target size, '
+                    'holding position'
                 )
                 return
 
-            # Keep advancing even if YOLO drops out temporarily; stop only when
-            # a fresh bbox proves the person is now much larger in frame.
+            if (
+                person_target is not None
+                and self._is_target_near_bottom_edge(person_target)
+            ):
+                self._finish_bbox_growth_approach(
+                    'Person action: target reached lower camera edge, '
+                    'holding position'
+                )
+                return
+
+            if (
+                person_target is None
+                and self._should_stop_after_approach_loss()
+            ):
+                self._finish_bbox_growth_approach(
+                    'Person action: target lost during forward approach, '
+                    'holding position'
+                )
+                return
+
             self._step_forward_for_bbox_growth()
             return
 
@@ -982,17 +1135,13 @@ class OffboardTakeoff(Node):
             ):
                 return
 
-            self._prepare_return_home_waypoint()
-            self.set_state(
-                MissionState.RETURN_HOME,
-                'Person action complete, returning home',
-            )
+            self._finish_person_action()
             return
 
         self._hold_current_position_target()
 
     def handle_return_home(self):
-        """Fly back to the saved home position before landing."""
+        """Fly back home, then either resume search or land."""
 
         if self.return_home_waypoint is None:
             if self.home_position is None:
@@ -1006,6 +1155,11 @@ class OffboardTakeoff(Node):
         self._update_smoothed_target()
 
         if self._has_reached_active_waypoint(check_yaw=False):
+            if self._advance_evacuation_route():
+                return
+            if self.pending_search_resume_after_home:
+                self._resume_search_after_home_reached()
+                return
             self.set_state(MissionState.LAND, 'Home position reached')
 
     def handle_land(self):
@@ -1102,6 +1256,8 @@ class OffboardTakeoff(Node):
             return False
         if not self.enable_person_follow:
             return False
+        if self._is_person_detection_ignored():
+            return False
 
         person_target = self._current_person_target()
         if person_target is None:
@@ -1161,13 +1317,23 @@ class OffboardTakeoff(Node):
         self.active_waypoint_started_at = self.get_clock().now()
         self.person_detection_started_at = None
         self.person_follow_confirmation_logged = False
+        if self.current_search_waypoint_index is None:
+            if self.mission_plan.search_waypoints:
+                self.resume_search_waypoint_index = 0
+        else:
+            self.resume_search_waypoint_index = (
+                self.current_search_waypoint_index
+            )
         self.set_state(
             MissionState.FOLLOW_PERSON,
             'Person confirmed, stopping search and starting visual approach',
         )
         # Remember the bbox size at the moment of confirmed detection. During
         # the forward segment we compare new detections against this baseline.
-        self.person_reference_bbox_height = max(float(person_target.height), 1.0)
+        self.person_reference_bbox_height = max(
+            float(person_target.height),
+            1.0,
+        )
         self.get_logger().info(
             'Person follow engaged: '
             f'confidence={person_target.confidence:.2f}, '
@@ -1179,10 +1345,203 @@ class OffboardTakeoff(Node):
         self._hold_current_position_target()
         return True
 
+    def _finish_person_action(self):
+        """Finish the person interaction and return home before patrol."""
+
+        self.get_logger().info(
+            'Person action complete: preparing evacuation return route'
+        )
+        self.pending_search_resume_after_home = True
+        self.pending_teleport_after_home = True
+        self._prepare_return_home_waypoint()
+        self._prepare_evacuation_route()
+        self.set_state(
+            MissionState.RETURN_HOME,
+            'Person fixed, returning home before resuming search',
+        )
+
+    def _resume_search_after_home_reached(self):
+        """Teleport the configured model down and continue the search."""
+
+        self._hold_current_position_target()
+        self._begin_post_rescue_cooldown()
+        if (
+            self.pending_teleport_after_home
+            and not self.rescue_model_teleported
+        ):
+            self.rescue_model_teleported = (
+                self._teleport_rescue_model_down()
+            )
+        self.pending_teleport_after_home = False
+        self.pending_search_resume_after_home = False
+        self.return_home_waypoint = None
+
+        if not self.mission_plan.search_waypoints:
+            self._complete_mission()
+            return
+
+        if self.resume_search_waypoint_index is None:
+            resume_index = 0
+        else:
+            resume_index = min(
+                self.resume_search_waypoint_index,
+                len(self.mission_plan.search_waypoints) - 1,
+            )
+        self._select_search_waypoint(resume_index)
+        if self.current_search_waypoint is not None:
+            self.target = self._target_from_waypoint(
+                self.current_search_waypoint
+            )
+        self.set_state(
+            MissionState.SEARCH,
+            'Home reached, resuming search mission',
+        )
+
+    def _begin_post_rescue_cooldown(self):
+        """Clear tracked target state and ignore detections briefly."""
+
+        self.person_target = None
+        self.last_stable_person_target = None
+        self.last_stable_person_target_at = None
+        self.person_visible_since = None
+        self.person_detection_started_at = None
+        self.person_detection_lost_at = None
+        self.last_person_detection_log_at = None
+        self.person_follow_confirmation_logged = False
+        if self.post_rescue_detection_cooldown_sec > 0.0:
+            self.person_detection_ignore_until = self.get_clock().now()
+        else:
+            self.person_detection_ignore_until = None
+
+    def _teleport_rescue_model_down(self):
+        """Teleport one configured Gazebo model below the scene."""
+
+        if not self.rescue_model_name:
+            return
+
+        request = (
+            f'name: "{self.rescue_model_name}" '
+            f'position {{ '
+            f'x: {self.rescue_model_teleport_x} '
+            f'y: {self.rescue_model_teleport_y} '
+            f'z: {self.rescue_model_teleport_z} }} '
+            'orientation { x: 0 y: 0 z: 0 w: 1 }'
+        )
+        world_candidates = []
+        if self.teleport_world_name:
+            world_candidates.append(self.teleport_world_name)
+        for world_name in ('forest', 'default', 'empty'):
+            if world_name not in world_candidates:
+                world_candidates.append(world_name)
+
+        for world_name in world_candidates:
+            if self._teleport_model_via_service(world_name, request):
+                self.get_logger().info(
+                    f'Model {self.rescue_model_name} teleported in world '
+                    f'{world_name} to z={self.rescue_model_teleport_z:.1f}'
+                )
+                return True
+            if self._teleport_model_via_topic(world_name, request):
+                self.get_logger().info(
+                    f'Model {self.rescue_model_name} teleported via topic '
+                    f'in world {world_name} to '
+                    f'z={self.rescue_model_teleport_z:.1f}'
+                )
+                return True
+
+        self.get_logger().warning(
+            f'Could not teleport model {self.rescue_model_name} in any world'
+        )
+        return False
+
+    def _teleport_model_via_service(
+        self,
+        world_name: str,
+        request: str,
+    ) -> bool:
+        """Try teleporting a model using Gazebo's set_pose service."""
+
+        command = [
+            'gz',
+            'service',
+            '-s',
+            f'/world/{world_name}/set_pose',
+            '--reqtype',
+            'gz.msgs.Pose',
+            '--reptype',
+            'gz.msgs.Boolean',
+            '--timeout',
+            str(self.rescue_service_timeout_ms),
+            '--req',
+            request,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(self.rescue_service_timeout_ms / 1000.0, 1.0),
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+            self.get_logger().warning(
+                f'Failed to teleport {self.rescue_model_name}: {error}'
+            )
+            return False
+
+        return result.returncode == 0
+
+    def _teleport_model_via_topic(
+        self,
+        world_name: str,
+        request: str,
+    ) -> bool:
+        """Fallback teleport using Gazebo's pose-modify topic."""
+
+        command = [
+            'gz',
+            'topic',
+            '-t',
+            f'/world/{world_name}/pose/modify',
+            '-m',
+            'gz.msgs.Pose',
+            '-p',
+            request,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(self.rescue_service_timeout_ms / 1000.0, 1.0),
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+        return result.returncode == 0
+
+    def _is_person_detection_ignored(self) -> bool:
+        """Return whether fresh detections should be ignored temporarily."""
+
+        if self.person_detection_ignore_until is None:
+            return False
+        if (
+            self.age_sec(self.person_detection_ignore_until)
+            >= self.post_rescue_detection_cooldown_sec
+        ):
+            self.person_detection_ignore_until = None
+            return False
+        return True
+
     def _current_person_target(self) -> PersonTarget | None:
         """Return a fresh person target or None when it is stale."""
 
+        if self._is_person_detection_ignored():
+            return None
         if self.person_target is None:
+            return None
+        if self.person_target.confidence < self.follow_min_confidence:
             return None
         if (
             self.last_vision_received_at is None
@@ -1199,7 +1558,10 @@ class OffboardTakeoff(Node):
             if person_target is None:
                 self._hold_current_position_target()
                 return
-            self.person_reference_bbox_height = max(float(person_target.height), 1.0)
+            self.person_reference_bbox_height = max(
+                float(person_target.height),
+                1.0,
+            )
 
         self.person_action_phase = 'APPROACH_FORWARD'
         self.person_action_phase_started_at = self.get_clock().now()
@@ -1239,6 +1601,56 @@ class OffboardTakeoff(Node):
             >= self.person_reference_bbox_height * growth_target
         )
 
+    def _is_target_near_bottom_edge(self, person_target: PersonTarget) -> bool:
+        """Return whether the bbox is about to leave through frame bottom."""
+
+        edge_margin = min(
+            max(self.follow_bottom_edge_margin_ratio, 0.0),
+            0.5,
+        )
+        return person_target.bottom_ratio >= 1.0 - edge_margin
+
+    def _should_stop_after_approach_loss(self) -> bool:
+        """Stop forward approach when the target is not safely tracked."""
+
+        now = self.get_clock().now()
+        if self.person_approach_loss_started_at is None:
+            self.person_approach_loss_started_at = now
+
+        if (
+            self.last_approach_person_target is not None
+            and self._is_target_near_bottom_edge(
+                self.last_approach_person_target
+            )
+        ):
+            return True
+
+        return (
+            self.age_sec(self.person_approach_loss_started_at)
+            >= max(self.follow_approach_dropout_stop_sec, 0.0)
+        )
+
+    def _has_approach_forward_timed_out(self) -> bool:
+        """Return whether the forward approach has taken too long."""
+
+        if self.follow_approach_max_sec <= 0.0:
+            return False
+        if self.person_action_phase_started_at is None:
+            return False
+        return (
+            self.age_sec(self.person_action_phase_started_at)
+            >= self.follow_approach_max_sec
+        )
+
+    def _finish_bbox_growth_approach(self, reason: str):
+        """Stop forward motion and transition to the post-approach hover."""
+
+        self.person_action_phase = 'HOLD_AFTER_APPROACH'
+        self.person_action_phase_started_at = self.get_clock().now()
+        self.person_approach_loss_started_at = None
+        self._hold_person_follow_position()
+        self.get_logger().info(reason)
+
     def _step_forward_for_bbox_growth(self):
         """Advance the target forward with a small lead so PX4 keeps moving."""
 
@@ -1251,7 +1663,9 @@ class OffboardTakeoff(Node):
         if not math.isfinite(heading):
             heading = 0.0
 
-        step_distance = max(self.follow_forward_speed, 0.0) * self.control_period
+        step_distance = (
+            max(self.follow_forward_speed, 0.0) * self.control_period
+        )
         lead_dx = self.target.x - self.vehicle_local_position.x
         lead_dy = self.target.y - self.vehicle_local_position.y
         lead_distance = math.hypot(lead_dx, lead_dy)
@@ -1339,7 +1753,7 @@ class OffboardTakeoff(Node):
         )
 
     def _is_person_follow_centered(self) -> bool:
-        """Return whether yaw should stay locked on the current centered target."""
+        """Return whether yaw should stay locked on the centered target."""
 
         error = abs(self.filtered_person_center_x_error)
         now = self.get_clock().now()
@@ -1360,7 +1774,10 @@ class OffboardTakeoff(Node):
             self.person_centered_since = now
             return False
 
-        if self.age_sec(self.person_centered_since) < self.follow_centered_hold_sec:
+        if (
+            self.age_sec(self.person_centered_since)
+            < self.follow_centered_hold_sec
+        ):
             return False
 
         if self.target is not None and math.isfinite(self.target.yaw):
@@ -1372,7 +1789,7 @@ class OffboardTakeoff(Node):
         return True
 
     def _hold_person_follow_position(self):
-        """Freeze position and reset yaw-follow state while the target stays centered."""
+        """Freeze position while the target remains centered."""
 
         if self.vehicle_local_position is None:
             return
@@ -1734,6 +2151,9 @@ class OffboardTakeoff(Node):
     def _prepare_return_home_waypoint(self):
         """Create a return-home target at home XY and mission altitude."""
 
+        self.evacuation_route_waypoints = []
+        self.evacuation_route_index = 0
+
         if self.home_position is None:
             self.return_home_waypoint = None
             return
@@ -1757,6 +2177,109 @@ class OffboardTakeoff(Node):
                 self.return_home_waypoint.y,
                 self.return_home_waypoint.z,
                 self.return_home_waypoint.yaw,
+            )
+        )
+
+    def _prepare_evacuation_route(self):
+        """Plan an obstacle-aware route from current pose to home."""
+
+        if not self.enable_evacuation_astar:
+            return
+        if self.vehicle_local_position is None:
+            return
+        if self.home_position is None or self.return_home_waypoint is None:
+            return
+
+        start = (
+            float(self.vehicle_local_position.x),
+            float(self.vehicle_local_position.y),
+        )
+        goal = (
+            float(self.return_home_waypoint.x),
+            float(self.return_home_waypoint.y),
+        )
+        config = PlannerConfig(
+            world_sdf_path=self.evacuation_world_sdf_path,
+            grid_resolution=self.evacuation_grid_resolution,
+            obstacle_margin=self.evacuation_obstacle_margin,
+            map_padding=self.evacuation_map_padding,
+            waypoint_spacing=self.evacuation_waypoint_spacing,
+            mission_rotation_deg=self.evacuation_mission_rotation_deg,
+            mission_invert_y=self.evacuation_mission_invert_y,
+            max_iterations=self.evacuation_max_iterations,
+        )
+        planner = EvacuationRoutePlanner(config)
+        route_xy = planner.plan(start=start, goal=goal)
+        if len(route_xy) < 2:
+            self.get_logger().warning(
+                'A* evacuation route was not found, using direct return-home'
+            )
+            return
+
+        return_yaw = self.return_home_waypoint.yaw
+        altitude = self.mission_plan.takeoff_waypoint.z
+        # Skip the first point because it is the current vehicle position.
+        self.evacuation_route_waypoints = [
+            Waypoint(x=x, y=y, z=altitude, yaw=return_yaw)
+            for x, y in route_xy[1:]
+        ]
+        self.evacuation_route_index = 0
+        self.return_home_waypoint = self.evacuation_route_waypoints[0]
+        self.active_waypoint_started_at = self.get_clock().now()
+        self._publish_evacuation_route(route_xy)
+        self.get_logger().info(
+            'A* evacuation route planned: '
+            f'obstacles={len(planner.obstacles)}, '
+            f'waypoints={len(self.evacuation_route_waypoints)}'
+        )
+        self._log_evacuation_waypoint()
+
+    def _publish_evacuation_route(self, route_xy: list[tuple[float, float]]):
+        """Publish the latest A* route for map viewers."""
+
+        message = Float32MultiArray()
+        data: list[float] = []
+        for x, y in route_xy:
+            data.extend([float(x), float(y)])
+        message.data = data
+        self.evacuation_route_pub.publish(message)
+
+    def _advance_evacuation_route(self) -> bool:
+        """Advance to the next A* evacuation waypoint if one exists."""
+
+        if not self.evacuation_route_waypoints:
+            return False
+        if self.evacuation_route_index >= len(
+            self.evacuation_route_waypoints
+        ) - 1:
+            self.evacuation_route_waypoints = []
+            self.evacuation_route_index = 0
+            return False
+
+        self.evacuation_route_index += 1
+        self.return_home_waypoint = self.evacuation_route_waypoints[
+            self.evacuation_route_index
+        ]
+        self.active_waypoint_started_at = self.get_clock().now()
+        self._log_evacuation_waypoint()
+        return True
+
+    def _log_evacuation_waypoint(self):
+        """Log active A* evacuation waypoint."""
+
+        if self.return_home_waypoint is None:
+            return
+        if not self.evacuation_route_waypoints:
+            return
+
+        self.get_logger().info(
+            'A* evacuation waypoint %d/%d -> x=%.2f y=%.2f z=%.2f'
+            % (
+                self.evacuation_route_index + 1,
+                len(self.evacuation_route_waypoints),
+                self.return_home_waypoint.x,
+                self.return_home_waypoint.y,
+                self.return_home_waypoint.z,
             )
         )
 

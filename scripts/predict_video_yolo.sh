@@ -5,7 +5,7 @@ ROOT_DIR="/home/dron/px4_offboard_clean_ws"
 VENV_PYTHON="${ROOT_DIR}/.venv-yolo/bin/python"
 PREDICT_SCRIPT="${ROOT_DIR}/tools/predict_video_yolo.py"
 
-WEIGHTS="${WEIGHTS:-/home/dron/.gz/models/yolo12n_people_package/runs/yolo12n_people_v1_safe2/weights/best.pt}"
+WEIGHTS="${WEIGHTS:-/home/dron/.gz/models/yolo12n_people_package/runs/yolo12s_people_e30_b62/weights/best.pt}"
 SOURCE="${SOURCE:-}"
 DEVICE="${DEVICE:-0}"
 IMGSZ="${IMGSZ:-960}"
