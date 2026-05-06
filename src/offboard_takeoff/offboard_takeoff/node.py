@@ -27,6 +27,7 @@ from offboard_takeoff.navigation import is_yaw_reached
 from offboard_takeoff.navigation import smooth_target_towards_waypoint
 from offboard_takeoff.path_planner import EvacuationRoutePlanner
 from offboard_takeoff.path_planner import PlannerConfig
+from offboard_takeoff.path_planner import SearchCoveragePlanner
 
 
 class MissionState(Enum):
@@ -123,9 +124,8 @@ class OffboardTakeoff(Node):
         self._declare_parameters()
         self._load_parameters()
 
-        self.mission_plan: MissionPlan = default_mission_plan(
-            self.takeoff_height
-        )
+        self.search_route_xy: list[tuple[float, float]] = []
+        self.mission_plan: MissionPlan = self._build_mission_plan()
         self.required_initial_setpoints = 30
 
         self.vehicle_local_position: VehicleLocalPosition | None = None
@@ -146,6 +146,7 @@ class OffboardTakeoff(Node):
         self.last_offboard_request_at = None
         self.last_person_follow_log_at = self.node_started_at
         self.last_person_detection_log_at = None
+        self.last_search_route_published_at = None
         self.person_follow_started_at = None
         self.person_detection_ignore_until = None
         self.pending_search_resume_after_home = False
@@ -203,6 +204,11 @@ class OffboardTakeoff(Node):
             'mission/evacuation_route',
             10,
         )
+        self.search_route_pub = self.create_publisher(
+            Float32MultiArray,
+            'mission/search_route',
+            10,
+        )
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -230,6 +236,7 @@ class OffboardTakeoff(Node):
         )
 
         self.timer = self.create_timer(self.control_period, self.control_loop)
+        self._publish_search_route()
         self.get_logger().info('OffboardTakeoff node started')
         self.get_logger().info('Waiting for initial PX4 data...')
 
@@ -238,7 +245,7 @@ class OffboardTakeoff(Node):
 
         self.declare_parameter('control_rate_hz', 10.0)
         self.declare_parameter('takeoff_height', 7.0)
-        self.declare_parameter('max_speed', 1.5)
+        self.declare_parameter('max_speed', 3.0)
         # Previous tuning: max_yaw_rate=0.4, follow_yaw_kp=0.9,
         # follow_align_dropout_continue_sec=1.0,
         # follow_target_memory_timeout_sec=1.0.
@@ -246,7 +253,7 @@ class OffboardTakeoff(Node):
         self.declare_parameter('waypoint_tolerance', 0.4)
         self.declare_parameter('yaw_tolerance', 0.3)
         self.declare_parameter('px4_data_timeout_sec', 1.0)
-        self.declare_parameter('waypoint_timeout_sec', 45.0)
+        self.declare_parameter('waypoint_timeout_sec', 120.0)
         self.declare_parameter('arming_timeout_sec', 5.0)
         self.declare_parameter('hold_timeout_margin_sec', 1.0)
         self.declare_parameter('return_home_on_failure', True)
@@ -254,7 +261,11 @@ class OffboardTakeoff(Node):
         self.declare_parameter('enable_vision', False)
         self.declare_parameter('vision_timeout_sec', 1.0)
         self.declare_parameter('enable_person_follow', True)
-        self.declare_parameter('follow_min_confidence', 0.50)
+        self.declare_parameter('follow_min_confidence', 0.70)
+        self.declare_parameter('search_min_bbox_width_px', 40)
+        self.declare_parameter('search_min_bbox_height_px', 40)
+        self.declare_parameter('follow_min_bbox_width_px', 35)
+        self.declare_parameter('follow_min_bbox_height_px', 35)
         self.declare_parameter('follow_detection_confirm_sec', 1.0)
         self.declare_parameter('follow_detection_gap_tolerance_sec', 0.5)
         self.declare_parameter('post_rescue_detection_cooldown_sec', 5.0)
@@ -263,7 +274,7 @@ class OffboardTakeoff(Node):
         self.declare_parameter('rescue_model_teleport_y', 28.2)
         self.declare_parameter('rescue_model_teleport_z', -10.0)
         self.declare_parameter('rescue_service_timeout_ms', 2000)
-        self.declare_parameter('teleport_world_name', 'forest')
+        self.declare_parameter('teleport_world_name', 'forest_big')
         self.declare_parameter('follow_person_action_timeout_sec', 90.0)
         self.declare_parameter('follow_stop_before_approach_sec', 1.0)
         self.declare_parameter('follow_bbox_growth_target', 4.0)
@@ -295,7 +306,10 @@ class OffboardTakeoff(Node):
         self.declare_parameter('enable_evacuation_astar', True)
         self.declare_parameter(
             'evacuation_world_sdf_path',
-            '/home/dron/PX4-Autopilot/Tools/simulation/gz/worlds/forest.sdf',
+            (
+                '/home/dron/PX4-Autopilot/Tools/simulation/gz/worlds/'
+                'forest_big.sdf'
+            ),
         )
         self.declare_parameter('evacuation_grid_resolution', 1.0)
         self.declare_parameter('evacuation_obstacle_margin', 3.0)
@@ -304,6 +318,24 @@ class OffboardTakeoff(Node):
         self.declare_parameter('evacuation_mission_rotation_deg', 90.0)
         self.declare_parameter('evacuation_mission_invert_y', True)
         self.declare_parameter('evacuation_max_iterations', 20000)
+        self.declare_parameter('enable_auto_search_route', True)
+        self.declare_parameter(
+            'search_world_sdf_path',
+            (
+                '/home/dron/PX4-Autopilot/Tools/simulation/gz/worlds/'
+                'forest_big.sdf'
+            ),
+        )
+        self.declare_parameter('search_grid_resolution', 1.0)
+        self.declare_parameter('search_obstacle_margin', 1.5)
+        self.declare_parameter('search_map_padding', 4.0)
+        self.declare_parameter('search_row_spacing', 7.0)
+        self.declare_parameter('search_waypoint_spacing', 3.0)
+        self.declare_parameter('search_hold_time_sec', 1.5)
+        self.declare_parameter('search_route_publish_period_sec', 2.0)
+        self.declare_parameter('search_mission_rotation_deg', 90.0)
+        self.declare_parameter('search_mission_invert_y', True)
+        self.declare_parameter('search_max_iterations', 20000)
 
     def _load_parameters(self):
         """Load ROS2 parameters into node fields."""
@@ -346,6 +378,22 @@ class OffboardTakeoff(Node):
         )
         self.follow_min_confidence = float(
             self.get_parameter('follow_min_confidence').value
+        )
+        self.search_min_bbox_width_px = max(
+            int(self.get_parameter('search_min_bbox_width_px').value),
+            0,
+        )
+        self.search_min_bbox_height_px = max(
+            int(self.get_parameter('search_min_bbox_height_px').value),
+            0,
+        )
+        self.follow_min_bbox_width_px = max(
+            int(self.get_parameter('follow_min_bbox_width_px').value),
+            0,
+        )
+        self.follow_min_bbox_height_px = max(
+            int(self.get_parameter('follow_min_bbox_height_px').value),
+            0,
         )
         self.follow_detection_confirm_sec = float(
             self.get_parameter('follow_detection_confirm_sec').value
@@ -486,6 +534,42 @@ class OffboardTakeoff(Node):
         self.evacuation_max_iterations = int(
             self.get_parameter('evacuation_max_iterations').value
         )
+        self.enable_auto_search_route = bool(
+            self.get_parameter('enable_auto_search_route').value
+        )
+        self.search_world_sdf_path = str(
+            self.get_parameter('search_world_sdf_path').value
+        ).strip()
+        self.search_grid_resolution = float(
+            self.get_parameter('search_grid_resolution').value
+        )
+        self.search_obstacle_margin = float(
+            self.get_parameter('search_obstacle_margin').value
+        )
+        self.search_map_padding = float(
+            self.get_parameter('search_map_padding').value
+        )
+        self.search_row_spacing = float(
+            self.get_parameter('search_row_spacing').value
+        )
+        self.search_waypoint_spacing = float(
+            self.get_parameter('search_waypoint_spacing').value
+        )
+        self.search_hold_time_sec = float(
+            self.get_parameter('search_hold_time_sec').value
+        )
+        self.search_route_publish_period_sec = float(
+            self.get_parameter('search_route_publish_period_sec').value
+        )
+        self.search_mission_rotation_deg = float(
+            self.get_parameter('search_mission_rotation_deg').value
+        )
+        self.search_mission_invert_y = bool(
+            self.get_parameter('search_mission_invert_y').value
+        )
+        self.search_max_iterations = int(
+            self.get_parameter('search_max_iterations').value
+        )
 
     @property
     def current_search_waypoint(self) -> Waypoint | None:
@@ -502,6 +586,144 @@ class OffboardTakeoff(Node):
         return self.mission_plan.search_waypoints[
             self.current_search_waypoint_index
         ]
+
+    def _build_mission_plan(self) -> MissionPlan:
+        """Build the search mission from the map, with static fallback."""
+
+        fallback_plan = default_mission_plan(self.takeoff_height)
+        if not self.enable_auto_search_route:
+            return fallback_plan
+
+        config = PlannerConfig(
+            world_sdf_path=self.search_world_sdf_path,
+            grid_resolution=self.search_grid_resolution,
+            obstacle_margin=self.search_obstacle_margin,
+            map_padding=self.search_map_padding,
+            waypoint_spacing=self.search_waypoint_spacing,
+            coverage_row_spacing=self.search_row_spacing,
+            mission_rotation_deg=self.search_mission_rotation_deg,
+            mission_invert_y=self.search_mission_invert_y,
+            max_iterations=self.search_max_iterations,
+        )
+        planner = SearchCoveragePlanner(config)
+        route_start_xy = (
+            fallback_plan.takeoff_waypoint.x,
+            fallback_plan.takeoff_waypoint.y,
+        )
+        route_xy = planner.plan_coverage(start=route_start_xy)
+        if len(route_xy) < 2:
+            self.get_logger().warning(
+                'Auto search route was not generated, using static mission'
+            )
+            self.search_route_xy = [
+                (waypoint.x, waypoint.y)
+                for waypoint in fallback_plan.search_waypoints
+            ]
+            return fallback_plan
+
+        self.search_route_xy = route_xy
+        working_altitude = -abs(self.takeoff_height)
+        search_waypoints = self._waypoints_from_search_route(
+            route_xy,
+            working_altitude,
+            route_start_xy,
+        )
+        self.get_logger().info(
+            'Auto search route generated from SDF: '
+            f'obstacles={len(planner.obstacles)}, '
+            f'waypoints={len(search_waypoints)}'
+        )
+        return MissionPlan(
+            takeoff_waypoint=Waypoint(
+                x=0.0,
+                y=0.0,
+                z=working_altitude,
+                yaw=0.0,
+            ),
+            search_waypoints=tuple(search_waypoints),
+        )
+
+    def _waypoints_from_search_route(
+        self,
+        route_xy: list[tuple[float, float]],
+        altitude: float,
+        route_start_xy: tuple[float, float] | None,
+    ) -> list[Waypoint]:
+        """Convert a 2D coverage route into mission waypoints."""
+
+        waypoints: list[Waypoint] = []
+        for index, (x, y) in enumerate(route_xy):
+            yaw = self._route_yaw(route_xy, index, route_start_xy)
+            hold_time = 0.0
+            if index == len(route_xy) - 1:
+                hold_time = max(self.search_hold_time_sec, 0.0)
+            elif index > 0:
+                prev_x, prev_y = route_xy[index - 1]
+                next_x, next_y = route_xy[index + 1]
+                prev_heading = math.atan2(y - prev_y, x - prev_x)
+                next_heading = math.atan2(next_y - y, next_x - x)
+                if (
+                    abs(self._normalize_angle(next_heading - prev_heading))
+                    > 0.2
+                ):
+                    hold_time = max(self.search_hold_time_sec, 0.0)
+            waypoints.append(
+                Waypoint(
+                    x=float(x),
+                    y=float(y),
+                    z=altitude,
+                    yaw=yaw,
+                    hold_time=hold_time,
+                )
+            )
+        return waypoints
+
+    def _route_yaw(
+        self,
+        route_xy: list[tuple[float, float]],
+        index: int,
+        route_start_xy: tuple[float, float] | None,
+    ) -> float:
+        """Estimate yaw in the direction of travel into the waypoint."""
+
+        if len(route_xy) <= 1:
+            return 0.0
+        if index > 0:
+            from_x, from_y = route_xy[index - 1]
+            to_x, to_y = route_xy[index]
+        elif route_start_xy is not None:
+            from_x, from_y = route_start_xy
+            to_x, to_y = route_xy[index]
+        else:
+            from_x, from_y = route_xy[index]
+            to_x, to_y = route_xy[index + 1]
+        return math.atan2(to_y - from_y, to_x - from_x)
+
+    def _publish_search_route(self):
+        """Publish the generated search route for map/debug viewers."""
+
+        if not self.search_route_xy:
+            return
+        message = Float32MultiArray()
+        data: list[float] = []
+        for x, y in self.search_route_xy:
+            data.extend([float(x), float(y)])
+        message.data = data
+        self.search_route_pub.publish(message)
+        self.last_search_route_published_at = self.get_clock().now()
+
+    def _maybe_publish_search_route(self):
+        """Republish the route periodically for late map viewers."""
+
+        if self.search_route_publish_period_sec <= 0.0:
+            return
+        if (
+            self.last_search_route_published_at is not None
+            and self.age_sec(self.last_search_route_published_at)
+            < self.search_route_publish_period_sec
+        ):
+            return
+        self._publish_search_route()
 
     @property
     def active_waypoint(self) -> Waypoint | None:
@@ -851,6 +1073,7 @@ class OffboardTakeoff(Node):
         safety_ok = self.check_safety()
         if not safety_ok and self.state == MissionState.FINISHED:
             return
+        self._maybe_publish_search_route()
 
         handlers = {
             MissionState.INIT: self.handle_init,
@@ -1430,7 +1653,7 @@ class OffboardTakeoff(Node):
         world_candidates = []
         if self.teleport_world_name:
             world_candidates.append(self.teleport_world_name)
-        for world_name in ('forest', 'default', 'empty'):
+        for world_name in ('forest_big', 'forest', 'default', 'empty'):
             if world_name not in world_candidates:
                 world_candidates.append(world_name)
 
@@ -1543,6 +1766,8 @@ class OffboardTakeoff(Node):
             return None
         if self.person_target.confidence < self.follow_min_confidence:
             return None
+        if not self._has_required_person_bbox_size(self.person_target):
+            return None
         if (
             self.last_vision_received_at is None
             or self.age_sec(self.last_vision_received_at)
@@ -1550,6 +1775,31 @@ class OffboardTakeoff(Node):
         ):
             return None
         return self.person_target
+
+    def _has_required_person_bbox_size(
+        self,
+        person_target: PersonTarget,
+    ) -> bool:
+        """Return whether bbox is large enough for mission reaction."""
+
+        min_width, min_height = self._active_bbox_size_threshold()
+        return (
+            person_target.width >= min_width
+            and person_target.height >= min_height
+        )
+
+    def _active_bbox_size_threshold(self) -> tuple[int, int]:
+        """Return bbox threshold for search or active following."""
+
+        if self.state == MissionState.FOLLOW_PERSON:
+            return (
+                self.follow_min_bbox_width_px,
+                self.follow_min_bbox_height_px,
+            )
+        return (
+            self.search_min_bbox_width_px,
+            self.search_min_bbox_height_px,
+        )
 
     def _start_bbox_growth_approach(self):
         """Start flying forward until the detected bbox grows enough."""

@@ -19,6 +19,7 @@ class PlannerConfig:
     obstacle_margin: float = 3.0
     map_padding: float = 8.0
     waypoint_spacing: float = 3.0
+    coverage_row_spacing: float = 7.0
     mission_rotation_deg: float = 90.0
     mission_invert_y: bool = True
     max_iterations: int = 20000
@@ -498,3 +499,258 @@ class EvacuationRoutePlanner:
                 thinned.append(point)
         thinned.append(points[-1])
         return thinned
+
+
+class SearchCoveragePlanner(EvacuationRoutePlanner):
+    """Generate a map-derived lawnmower search route over free space."""
+
+    def plan_coverage(
+        self,
+        start: tuple[float, float] | None = None,
+    ) -> list[tuple[float, float]]:
+        """Plan a sweeping coverage route in mission-local XY coordinates."""
+
+        if not self.obstacles:
+            return []
+
+        min_x, max_x, min_y, max_y = self._coverage_bounds()
+        row_spacing = max(
+            self.config.coverage_row_spacing,
+            self.config.grid_resolution,
+        )
+        resolution = max(self.config.grid_resolution, 0.2)
+
+        rows: list[float] = []
+        row_y = max_y
+        while row_y >= min_y:
+            rows.append(row_y)
+            row_y -= row_spacing
+        if not rows or rows[-1] > min_y:
+            rows.append(min_y)
+
+        row_orders = self._row_order_candidates(rows, start)
+        candidates = [
+            self._build_coverage_route(
+                rows=ordered_rows,
+                min_x=min_x,
+                max_x=max_x,
+                resolution=resolution,
+                initial_left_to_right=initial_left_to_right,
+                start=start,
+            )
+            for ordered_rows in row_orders
+            for initial_left_to_right in (True, False)
+        ]
+        route = min(
+            (candidate for candidate in candidates if len(candidate) >= 2),
+            key=self._route_selection_cost,
+            default=[],
+        )
+
+        thinned_route = self._thin_waypoints(route)
+        if start is not None and thinned_route and thinned_route[0] == start:
+            return thinned_route[1:]
+        return thinned_route
+
+    def _row_order_candidates(
+        self,
+        rows: list[float],
+        start: tuple[float, float] | None,
+    ) -> list[list[float]]:
+        """Return useful row orders for coverage route selection."""
+
+        candidates = [rows, list(reversed(rows))]
+        if start is None or not rows:
+            return candidates
+
+        nearest_index = min(
+            range(len(rows)),
+            key=lambda index: abs(rows[index] - start[1]),
+        )
+        from_nearest_down = [
+            *rows[nearest_index:],
+            *reversed(rows[:nearest_index]),
+        ]
+        from_nearest_up = [
+            *reversed(rows[:nearest_index + 1]),
+            *rows[nearest_index + 1:],
+        ]
+        candidates.extend([from_nearest_down, from_nearest_up])
+        return candidates
+
+    def _route_selection_cost(
+        self,
+        route: list[tuple[float, float]],
+    ) -> tuple[float, float]:
+        """Prefer routes that start near home, then shorter total routes."""
+
+        if len(route) < 2:
+            return math.inf, math.inf
+        first_leg = math.hypot(
+            route[1][0] - route[0][0],
+            route[1][1] - route[0][1],
+        )
+        return first_leg, self._route_length(route)
+
+    def _build_coverage_route(
+        self,
+        rows: list[float],
+        min_x: float,
+        max_x: float,
+        resolution: float,
+        initial_left_to_right: bool,
+        start: tuple[float, float] | None,
+    ) -> list[tuple[float, float]]:
+        """Build one candidate sweep route for a row ordering."""
+
+        route: list[tuple[float, float]] = []
+        left_to_right = initial_left_to_right
+        if start is not None:
+            route.append(start)
+
+        for row_y in rows:
+            intervals = self._free_intervals_on_row(
+                row_y,
+                min_x,
+                max_x,
+                resolution,
+            )
+            if not intervals:
+                continue
+
+            ordered_intervals = intervals if left_to_right else list(
+                reversed(intervals)
+            )
+            for interval in ordered_intervals:
+                segment = self._segment_from_interval(
+                    interval,
+                    row_y,
+                    left_to_right,
+                )
+                self._append_segment_with_connector(route, segment)
+            left_to_right = not left_to_right
+
+        return route
+
+    def _route_length(self, route: list[tuple[float, float]]) -> float:
+        """Return total 2D route length."""
+
+        if len(route) < 2:
+            return math.inf
+        return sum(
+            math.hypot(
+                route[index][0] - route[index - 1][0],
+                route[index][1] - route[index - 1][1],
+            )
+            for index in range(1, len(route))
+        )
+
+    def _coverage_bounds(self) -> tuple[float, float, float, float]:
+        """Return padded bounds around map obstacles."""
+
+        xs: list[float] = []
+        ys: list[float] = []
+        for obstacle in self.obstacles:
+            for x, y in obstacle.corners:
+                xs.append(x)
+                ys.append(y)
+
+        padding = max(self.config.map_padding, self.config.obstacle_margin)
+        return (
+            min(xs) - padding,
+            max(xs) + padding,
+            min(ys) - padding,
+            max(ys) + padding,
+        )
+
+    def _free_intervals_on_row(
+        self,
+        y: float,
+        min_x: float,
+        max_x: float,
+        resolution: float,
+    ) -> list[tuple[float, float]]:
+        """Find contiguous free-space intervals on one sweep row."""
+
+        min_segment_length = max(self.config.waypoint_spacing, resolution)
+        intervals: list[tuple[float, float]] = []
+        interval_start: float | None = None
+        last_free_x: float | None = None
+
+        steps = int(math.ceil((max_x - min_x) / resolution))
+        for index in range(steps + 1):
+            x = min_x + index * resolution
+            if x > max_x:
+                x = max_x
+            is_free = not self._is_occupied(x, y)
+            if is_free:
+                if interval_start is None:
+                    interval_start = x
+                last_free_x = x
+                continue
+
+            if interval_start is not None and last_free_x is not None:
+                if last_free_x - interval_start >= min_segment_length:
+                    intervals.append((interval_start, last_free_x))
+            interval_start = None
+            last_free_x = None
+
+        if interval_start is not None and last_free_x is not None:
+            if last_free_x - interval_start >= min_segment_length:
+                intervals.append((interval_start, last_free_x))
+
+        return intervals
+
+    def _segment_from_interval(
+        self,
+        interval: tuple[float, float],
+        y: float,
+        left_to_right: bool,
+    ) -> list[tuple[float, float]]:
+        """Create a sweep segment from one free interval."""
+
+        start_x, end_x = interval
+        if left_to_right:
+            return [(start_x, y), (end_x, y)]
+        return [(end_x, y), (start_x, y)]
+
+    def _append_segment_with_connector(
+        self,
+        route: list[tuple[float, float]],
+        segment: list[tuple[float, float]],
+    ):
+        """Append a sweep segment, connecting from the prior point by A*."""
+
+        if not segment:
+            return
+        if not route:
+            route.extend(segment)
+            return
+
+        connector = self.plan(route[-1], segment[0])
+        if len(connector) >= 2:
+            route.extend(connector[1:])
+        elif self._line_segment_is_free(route[-1], segment[0]):
+            route.append(segment[0])
+        else:
+            return
+
+        route.extend(segment[1:])
+
+    def _line_segment_is_free(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> bool:
+        """Check direct visibility against polygon obstacles."""
+
+        distance = math.hypot(end[0] - start[0], end[1] - start[1])
+        resolution = max(self.config.grid_resolution * 0.5, 0.2)
+        steps = max(int(distance / resolution), 1)
+        for index in range(steps + 1):
+            ratio = index / float(steps)
+            x = start[0] + (end[0] - start[0]) * ratio
+            y = start[1] + (end[1] - start[1]) * ratio
+            if self._is_occupied(x, y):
+                return False
+        return True

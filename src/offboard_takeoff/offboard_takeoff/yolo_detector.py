@@ -1539,6 +1539,8 @@ class YoloDetector(Node):
                         'Target detected: '
                         f'label={target.label}, '
                         f'confidence={target.confidence:.2f}, '
+                        f'size={target.x2 - target.x1}x'
+                        f'{target.y2 - target.y1}, '
                         f'bbox=({target.x1}, {target.y1})-'
                         f'({target.x2}, {target.y2}), '
                         f'classes_in_frame={labels or ["<none>"]}'
@@ -1635,7 +1637,12 @@ class YoloDetector(Node):
                 if is_target
                 else detection.label.upper()
             )
-            label = f'{label_prefix} {detection.confidence:.2f}'
+            width = detection.x2 - detection.x1
+            height = detection.y2 - detection.y1
+            label = (
+                f'{label_prefix} {detection.confidence:.2f} '
+                f'{width}x{height}'
+            )
             box_thickness = 3 if is_target else 2
 
             cv2.rectangle(

@@ -46,6 +46,7 @@ class TopDownMapViewer(Node):
         self.objects = self._load_map_objects()
         self.bounds = self._compute_bounds(self.objects)
         self.vehicle_local_position: VehicleLocalPosition | None = None
+        self.search_route_points: list[tuple[float, float]] = []
         self.evacuation_route_points: list[tuple[float, float]] = []
         self.current_heading = 0.0
         self.window_available = True
@@ -68,6 +69,12 @@ class TopDownMapViewer(Node):
             self._evacuation_route_callback,
             10,
         )
+        self.create_subscription(
+            Float32MultiArray,
+            'mission/search_route',
+            self._search_route_callback,
+            10,
+        )
         self.timer = self.create_timer(
             max(self.refresh_period_sec, 0.05),
             self._draw_frame,
@@ -85,7 +92,10 @@ class TopDownMapViewer(Node):
 
         self.declare_parameter(
             'world_sdf_path',
-            '/home/dron/PX4-Autopilot/Tools/simulation/gz/worlds/forest.sdf',
+            (
+                '/home/dron/PX4-Autopilot/Tools/simulation/gz/worlds/'
+                'forest_big.sdf'
+            ),
         )
         self.declare_parameter(
             'model_search_paths',
@@ -105,6 +115,7 @@ class TopDownMapViewer(Node):
         self.declare_parameter('refresh_period_sec', 0.1)
         self.declare_parameter('draw_object_labels', True)
         self.declare_parameter('draw_axes', True)
+        self.declare_parameter('draw_search_route', True)
         self.declare_parameter('draw_evacuation_route', True)
         self.declare_parameter(
             'person_keywords',
@@ -165,6 +176,9 @@ class TopDownMapViewer(Node):
             self.get_parameter('draw_object_labels').value
         )
         self.draw_axes = bool(self.get_parameter('draw_axes').value)
+        self.draw_search_route = bool(
+            self.get_parameter('draw_search_route').value
+        )
         self.draw_evacuation_route = bool(
             self.get_parameter('draw_evacuation_route').value
         )
@@ -739,13 +753,25 @@ class TopDownMapViewer(Node):
         if math.isfinite(msg.heading):
             self.current_heading = float(msg.heading)
 
+    def _search_route_callback(self, msg: Float32MultiArray):
+        """Store latest planner search route in map coordinates."""
+
+        self.search_route_points = self._decode_route_points(msg)
+
     def _evacuation_route_callback(self, msg: Float32MultiArray):
         """Store latest A* evacuation route in map coordinates."""
 
+        self.evacuation_route_points = self._decode_route_points(msg)
+
+    def _decode_route_points(
+        self,
+        msg: Float32MultiArray,
+    ) -> list[tuple[float, float]]:
+        """Convert mission-local route message into map coordinates."""
+
         data = list(msg.data)
         if len(data) < 4:
-            self.evacuation_route_points = []
-            return
+            return []
 
         route_points = []
         for index in range(0, len(data) - 1, 2):
@@ -755,7 +781,7 @@ class TopDownMapViewer(Node):
                     float(data[index + 1]),
                 )
             )
-        self.evacuation_route_points = route_points
+        return route_points
 
     def _draw_frame(self):
         """Render one map frame."""
@@ -770,6 +796,7 @@ class TopDownMapViewer(Node):
         )
         self._draw_grid(frame)
         self._draw_objects(frame)
+        self._draw_search_route(frame)
         self._draw_evacuation_route(frame)
         self._draw_vehicle(frame)
         self._draw_header(frame)
@@ -887,6 +914,47 @@ class TopDownMapViewer(Node):
                     1,
                     cv2.LINE_AA,
                 )
+
+    def _draw_search_route(self, frame: np.ndarray):
+        """Draw the generated coverage search route."""
+
+        if not self.draw_search_route:
+            return
+        if len(self.search_route_points) < 2:
+            return
+
+        pixel_points = [
+            self._world_to_pixel(x, y)
+            for x, y in self.search_route_points
+        ]
+        polyline = np.array(pixel_points, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(
+            frame,
+            [polyline],
+            False,
+            (80, 150, 40),
+            2,
+            cv2.LINE_AA,
+        )
+
+        for index, point in enumerate(pixel_points):
+            if index % 4 != 0 and index not in {0, len(pixel_points) - 1}:
+                continue
+            radius = 6 if index in {0, len(pixel_points) - 1} else 3
+            cv2.circle(frame, point, radius, (70, 130, 35), -1)
+            cv2.circle(frame, point, radius, (245, 245, 240), 1)
+
+        start = pixel_points[0]
+        cv2.putText(
+            frame,
+            'search route',
+            (start[0] + 8, start[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (45, 105, 30),
+            2,
+            cv2.LINE_AA,
+        )
 
     def _draw_evacuation_route(self, frame: np.ndarray):
         """Draw the latest A* evacuation route."""

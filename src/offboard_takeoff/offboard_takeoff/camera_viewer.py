@@ -172,7 +172,7 @@ class CameraViewer(Node):
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         cv2.circle(frame, (center_x, center_y), 4, color, -1)
 
-        label = f'PERSON {confidence_milli / 1000.0:.2f}'
+        label = f'PERSON {confidence_milli / 1000.0:.2f} {width}x{height}'
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.6
         thickness = 2

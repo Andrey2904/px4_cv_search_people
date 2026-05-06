@@ -21,7 +21,7 @@ def generate_launch_description() -> LaunchDescription:
                 'world_sdf_path',
                 default_value=(
                     '/home/dron/PX4-Autopilot/Tools/simulation/gz/'
-                    'worlds/forest.sdf'
+                    'worlds/forest_big.sdf'
                 ),
                 description='Path to the Gazebo world SDF file.',
             ),
