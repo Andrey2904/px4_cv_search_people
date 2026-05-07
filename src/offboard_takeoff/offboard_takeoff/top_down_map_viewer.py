@@ -438,7 +438,7 @@ class TopDownMapViewer(Node):
             return size_x / 2.0, size_y / 2.0
 
         if model_name == 'roof_rubble':
-            square_size = max(size_x, size_y)
+            square_size = max(size_x, size_y) * 0.5
             return square_size, square_size
 
         if model_name == 'rubble':
@@ -447,7 +447,7 @@ class TopDownMapViewer(Node):
             return size_x, size_y / 2.0
 
         if model_name == 'mango_tree':
-            return size_x / 2.0, size_y / 2.0
+            return size_x * 0.625, size_y * 0.625
 
         return size_x, size_y
 

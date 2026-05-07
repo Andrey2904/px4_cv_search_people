@@ -25,7 +25,6 @@ What the current project does:
 - `src/offboard_takeoff/offboard_takeoff/mission.py`
 - `src/offboard_takeoff/offboard_takeoff/navigation.py`
 - `src/offboard_takeoff/offboard_takeoff/yolo_detector.py`
-- `src/offboard_takeoff/offboard_takeoff/grounding_dino_detector.py`
 - `src/offboard_takeoff/offboard_takeoff/camera_viewer.py`
 - `src/offboard_takeoff/launch/person_detection.launch.py`
 - `src/offboard_takeoff/config/yolo_detector.yaml`
@@ -147,24 +146,12 @@ Scene-map rescue parameters:
 
 ## Detector options
 
-The detector node supports:
-- `yolo`: Ultralytics `*.pt` checkpoints and classic YOLO ONNX exports;
-- `dino`: DINO or DETR-style ONNX models that still publish compatible `yolo/*` topics.
+The detector node supports YOLO inference with Ultralytics `*.pt` checkpoints
+and classic YOLO ONNX exports.
 
 Important runtime note:
 - `*.pt` inference needs `ultralytics`;
 - `*.onnx` inference uses `onnxruntime` when available and falls back to OpenCV DNN.
-
-## Grounding DINO option
-
-You can also run the prompt-based Grounding DINO node:
-
-```bash
-ros2 launch offboard_takeoff dino_detection.launch.py
-```
-
-It publishes the same target topics used by the mission logic, so the visual
-response pipeline can be reused without changing `node.py`.
 
 ## Useful launch overrides
 

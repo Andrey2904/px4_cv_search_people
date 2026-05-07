@@ -36,9 +36,9 @@ class Obstacle:
 MODEL_FOOTPRINTS = {
     'house': (16.27, 6.07),
     'destroy_building': (30.58, 28.97),
-    'roof_rubble': (6.03, 6.03),
+    'roof_rubble': (3.015, 3.015),
     'rubble': (10.79, 4.09),
-    'mango_tree': (3.38, 3.38),
+    'mango_tree': (4.225, 4.225),
 }
 
 EXCLUDED_MODEL_NAMES = {
