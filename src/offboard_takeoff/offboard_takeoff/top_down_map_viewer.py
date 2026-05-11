@@ -435,7 +435,7 @@ class TopDownMapViewer(Node):
         """Apply map-only footprint corrections for selected models."""
 
         if model_name == 'destroy_building':
-            return size_x / 2.0, size_y / 2.0
+            return size_x, size_y
 
         if model_name == 'roof_rubble':
             square_size = max(size_x, size_y) * 0.5

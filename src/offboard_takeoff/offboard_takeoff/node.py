@@ -142,6 +142,7 @@ class OffboardTakeoff(Node):
         self.last_local_position_received_at = None
         self.last_vehicle_status_received_at = None
         self.last_vision_received_at = None
+        self.px4_data_timeout_grace_started_at = None
         self.active_waypoint_started_at = None
         self.last_offboard_request_at = None
         self.last_person_follow_log_at = self.node_started_at
@@ -150,6 +151,7 @@ class OffboardTakeoff(Node):
         self.person_follow_started_at = None
         self.person_detection_ignore_until = None
         self.pending_search_resume_after_home = False
+        self.pending_search_resume_after_planned_route = False
         self.pending_teleport_after_home = False
         self.rescue_model_teleported = False
         self.resume_search_waypoint_index = None
@@ -253,6 +255,7 @@ class OffboardTakeoff(Node):
         self.declare_parameter('waypoint_tolerance', 0.4)
         self.declare_parameter('yaw_tolerance', 0.3)
         self.declare_parameter('px4_data_timeout_sec', 1.0)
+        self.declare_parameter('px4_data_timeout_grace_sec', 3.0)
         self.declare_parameter('waypoint_timeout_sec', 120.0)
         self.declare_parameter('arming_timeout_sec', 5.0)
         self.declare_parameter('hold_timeout_margin_sec', 1.0)
@@ -304,6 +307,8 @@ class OffboardTakeoff(Node):
         self.declare_parameter('follow_centered_hold_sec', 0.35)
         self.declare_parameter('follow_error_filter_alpha', 0.25)
         self.declare_parameter('enable_evacuation_astar', True)
+        self.declare_parameter('require_planned_rescue_return', True)
+        self.declare_parameter('require_planned_search_resume', True)
         self.declare_parameter(
             'evacuation_world_sdf_path',
             (
@@ -353,6 +358,9 @@ class OffboardTakeoff(Node):
         self.yaw_tolerance = float(self.get_parameter('yaw_tolerance').value)
         self.px4_data_timeout_sec = float(
             self.get_parameter('px4_data_timeout_sec').value
+        )
+        self.px4_data_timeout_grace_sec = float(
+            self.get_parameter('px4_data_timeout_grace_sec').value
         )
         self.waypoint_timeout_sec = float(
             self.get_parameter('waypoint_timeout_sec').value
@@ -509,6 +517,12 @@ class OffboardTakeoff(Node):
         )
         self.enable_evacuation_astar = bool(
             self.get_parameter('enable_evacuation_astar').value
+        )
+        self.require_planned_rescue_return = bool(
+            self.get_parameter('require_planned_rescue_return').value
+        )
+        self.require_planned_search_resume = bool(
+            self.get_parameter('require_planned_search_resume').value
         )
         self.evacuation_world_sdf_path = str(
             self.get_parameter('evacuation_world_sdf_path').value
@@ -824,6 +838,23 @@ class OffboardTakeoff(Node):
 
         return self.age_sec(self.state_entered_at)
 
+    def _start_px4_data_timeout_grace(self):
+        """Allow callbacks to catch up after a blocking Gazebo command."""
+
+        if self.px4_data_timeout_grace_sec <= 0.0:
+            return
+        self.px4_data_timeout_grace_started_at = self.get_clock().now()
+
+    def _is_px4_data_timeout_grace_active(self) -> bool:
+        """Return whether PX4 data timeout checks are temporarily relaxed."""
+
+        if self.px4_data_timeout_grace_started_at is None:
+            return False
+        return (
+            self.age_sec(self.px4_data_timeout_grace_started_at)
+            <= self.px4_data_timeout_grace_sec
+        )
+
     def set_state(self, new_state: MissionState, reason: str = ''):
         """Transition to a new mission state with optional logging."""
 
@@ -900,21 +931,27 @@ class OffboardTakeoff(Node):
             return True
 
         node_age_sec = self.age_sec(self.node_started_at)
+        px4_timeout_grace_active = self._is_px4_data_timeout_grace_active()
 
         if self.last_local_position_received_at is None:
-            if node_age_sec > self.px4_data_timeout_sec:
+            if (
+                node_age_sec > self.px4_data_timeout_sec
+                and not px4_timeout_grace_active
+            ):
                 return self.handle_failure(
                     'Local position data was not received'
                 )
         elif (
             self.age_sec(self.last_local_position_received_at)
             > self.px4_data_timeout_sec
+            and not px4_timeout_grace_active
         ):
             return self.handle_failure('Local position data timeout')
 
         if self.last_vehicle_status_received_at is not None and (
             self.age_sec(self.last_vehicle_status_received_at)
             > self.px4_data_timeout_sec
+            and not px4_timeout_grace_active
         ):
             return self.handle_failure('PX4 status data timeout')
 
@@ -1380,6 +1417,9 @@ class OffboardTakeoff(Node):
         if self._has_reached_active_waypoint(check_yaw=False):
             if self._advance_evacuation_route():
                 return
+            if self.pending_search_resume_after_planned_route:
+                self._resume_search_after_planned_route_reached()
+                return
             if self.pending_search_resume_after_home:
                 self._resume_search_after_home_reached()
                 return
@@ -1577,7 +1617,18 @@ class OffboardTakeoff(Node):
         self.pending_search_resume_after_home = True
         self.pending_teleport_after_home = True
         self._prepare_return_home_waypoint()
-        self._prepare_evacuation_route()
+        route_ready = self._prepare_evacuation_route()
+        if self.require_planned_rescue_return and not route_ready:
+            self.pending_search_resume_after_home = False
+            self.pending_teleport_after_home = False
+            self.pending_search_resume_after_planned_route = False
+            self.return_home_waypoint = None
+            self._hold_current_position_target()
+            self.set_state(
+                MissionState.FAILSAFE,
+                'Rescue return aborted: no obstacle-aware A* route to home',
+            )
+            return
         self.set_state(
             MissionState.RETURN_HOME,
             'Person fixed, returning home before resuming search',
@@ -1595,6 +1646,7 @@ class OffboardTakeoff(Node):
             self.rescue_model_teleported = (
                 self._teleport_rescue_model_down()
             )
+            self._start_px4_data_timeout_grace()
         self.pending_teleport_after_home = False
         self.pending_search_resume_after_home = False
         self.return_home_waypoint = None
@@ -1611,13 +1663,51 @@ class OffboardTakeoff(Node):
                 len(self.mission_plan.search_waypoints) - 1,
             )
         self._select_search_waypoint(resume_index)
-        if self.current_search_waypoint is not None:
-            self.target = self._target_from_waypoint(
-                self.current_search_waypoint
+        if self.current_search_waypoint is None:
+            self._complete_mission()
+            return
+
+        route_ready = self._prepare_planned_route_to_waypoint(
+            self.current_search_waypoint,
+            'search resume',
+        )
+        if route_ready:
+            self.pending_search_resume_after_planned_route = True
+            self.set_state(
+                MissionState.RETURN_HOME,
+                'Home reached, following A* route back to search',
             )
+            return
+
+        if self.require_planned_search_resume:
+            self.pending_search_resume_after_planned_route = False
+            self._hold_current_position_target()
+            self.set_state(
+                MissionState.FAILSAFE,
+                'Search resume aborted: no obstacle-aware A* route',
+            )
+            return
+
+        self.target = self._target_from_waypoint(self.current_search_waypoint)
         self.set_state(
             MissionState.SEARCH,
             'Home reached, resuming search mission',
+        )
+
+    def _resume_search_after_planned_route_reached(self):
+        """Switch back to search after the planned resume route is complete."""
+
+        self.pending_search_resume_after_planned_route = False
+        self.return_home_waypoint = None
+        if self.current_search_waypoint is None:
+            self._complete_mission()
+            return
+
+        self.target = self._target_from_waypoint(self.current_search_waypoint)
+        self.active_waypoint_started_at = self.get_clock().now()
+        self.set_state(
+            MissionState.SEARCH,
+            'A* route to search waypoint complete, resuming search',
         )
 
     def _begin_post_rescue_cooldown(self):
@@ -2430,23 +2520,46 @@ class OffboardTakeoff(Node):
             )
         )
 
-    def _prepare_evacuation_route(self):
+    def _prepare_evacuation_route(self) -> bool:
         """Plan an obstacle-aware route from current pose to home."""
 
+        return self._prepare_planned_route_to_waypoint(
+            self.return_home_waypoint,
+            'evacuation',
+        )
+
+    def _prepare_planned_route_to_waypoint(
+        self,
+        goal_waypoint: Waypoint | None,
+        route_label: str,
+    ) -> bool:
+        """Plan an obstacle-aware route from current pose to a waypoint."""
+
         if not self.enable_evacuation_astar:
-            return
+            self.get_logger().warning(
+                f'A* {route_label} route is disabled, planned route '
+                'unavailable'
+            )
+            return False
         if self.vehicle_local_position is None:
-            return
-        if self.home_position is None or self.return_home_waypoint is None:
-            return
+            self.get_logger().warning(
+                f'A* {route_label} route cannot be planned without local '
+                'position'
+            )
+            return False
+        if goal_waypoint is None:
+            self.get_logger().warning(
+                f'A* {route_label} route cannot be planned without target'
+            )
+            return False
 
         start = (
             float(self.vehicle_local_position.x),
             float(self.vehicle_local_position.y),
         )
         goal = (
-            float(self.return_home_waypoint.x),
-            float(self.return_home_waypoint.y),
+            float(goal_waypoint.x),
+            float(goal_waypoint.y),
         )
         config = PlannerConfig(
             world_sdf_path=self.evacuation_world_sdf_path,
@@ -2459,18 +2572,25 @@ class OffboardTakeoff(Node):
             max_iterations=self.evacuation_max_iterations,
         )
         planner = EvacuationRoutePlanner(config)
+        if not planner.obstacles:
+            self.get_logger().warning(
+                f'A* {route_label} route cannot be trusted: no SDF obstacles '
+                'were loaded from the configured world'
+            )
+            return False
         route_xy = planner.plan(start=start, goal=goal)
         if len(route_xy) < 2:
             self.get_logger().warning(
-                'A* evacuation route was not found, using direct return-home'
+                f'A* {route_label} route was not found; direct flight is '
+                'blocked'
             )
-            return
+            return False
 
-        return_yaw = self.return_home_waypoint.yaw
-        altitude = self.mission_plan.takeoff_waypoint.z
+        route_yaw = goal_waypoint.yaw
+        altitude = goal_waypoint.z
         # Skip the first point because it is the current vehicle position.
         self.evacuation_route_waypoints = [
-            Waypoint(x=x, y=y, z=altitude, yaw=return_yaw)
+            Waypoint(x=x, y=y, z=altitude, yaw=route_yaw)
             for x, y in route_xy[1:]
         ]
         self.evacuation_route_index = 0
@@ -2478,11 +2598,12 @@ class OffboardTakeoff(Node):
         self.active_waypoint_started_at = self.get_clock().now()
         self._publish_evacuation_route(route_xy)
         self.get_logger().info(
-            'A* evacuation route planned: '
+            f'A* {route_label} route planned: '
             f'obstacles={len(planner.obstacles)}, '
             f'waypoints={len(self.evacuation_route_waypoints)}'
         )
         self._log_evacuation_waypoint()
+        return True
 
     def _publish_evacuation_route(self, route_xy: list[tuple[float, float]]):
         """Publish the latest A* route for map viewers."""
